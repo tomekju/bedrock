@@ -222,9 +222,13 @@ defmodule Bedrock.DataPlane.Log.Shale.Server do
     with {:ok, transaction} <- Transaction.validate(transaction_bytes),
          :ok <- validate_has_shard_index(transaction),
          {:ok, t} <- push(t, expected_version, transaction, ack_fn(from)) do
+      # PATCHED (fuu): notify log pullers by the actual commit version, not the
+      # caller's expected previous version.
+      commit_version = Transaction.commit_version!(transaction)
+
       # Push to Demux for distribution to ShardServers (async)
-      Demux.Server.push(t.demux, expected_version, transaction)
-      noreply(t, continue: {:notify_waiting_pullers, expected_version, transaction})
+      Demux.Server.push(t.demux, commit_version, transaction)
+      noreply(t, continue: {:notify_waiting_pullers, commit_version, transaction})
     else
       {:wait, t} -> noreply(t, continue: :check_for_expired_pullers)
       {:error, _reason} = error -> reply(t, error, continue: :check_for_expired_pullers)

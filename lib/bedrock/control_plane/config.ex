@@ -34,10 +34,25 @@ defmodule Bedrock.ControlPlane.Config do
   Creates a new `Config` struct.
   """
   @spec new(coordinators :: [node()]) :: t()
-  def new(coordinators) do
+  def new(coordinators), do: new(coordinators, %{})
+
+  @spec new(coordinators :: [node()], parameter_overrides :: map()) :: t()
+  def new(coordinators, parameter_overrides) when is_map(parameter_overrides) do
+    parameters =
+      coordinators
+      |> Parameters.new()
+      # PATCHED (fuu): honor node-configured control-plane parameters on fresh bootstrap.
+      |> Map.merge(
+        Map.take(parameter_overrides, [
+          :desired_coordinators,
+          :desired_logs,
+          :desired_replication_factor
+        ])
+      )
+
     %{
       coordinators: coordinators,
-      parameters: Parameters.new(coordinators),
+      parameters: parameters,
       policies: Policies.default_policies()
     }
   end

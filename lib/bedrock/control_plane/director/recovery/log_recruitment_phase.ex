@@ -47,10 +47,12 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogRecruitmentPhase do
            ),
          {:ok, updated_services} <-
            create_new_log_workers(new_worker_ids, available_log_nodes, recovery_attempt, context),
+         # PATCHED (fuu): include newly-created log workers during recovery locking.
+         available_services = Map.merge(context.available_services, updated_services),
          {:ok, existing_log_services} <-
            extract_and_lock_existing_log_services(
              logs,
-             context.available_services,
+             available_services,
              recovery_attempt,
              context
            ) do
@@ -276,6 +278,17 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogRecruitmentPhase do
       {_kind, last_seen} = service ->
         handle_log_service_locking(
           service,
+          last_seen,
+          log_id,
+          recovery_attempt,
+          context,
+          locked_services
+        )
+
+      # PATCHED (fuu): newly-created workers are tracked as service maps, not directory tuples.
+      %{kind: kind, last_seen: last_seen} when kind == :log ->
+        handle_log_service_locking(
+          {kind, last_seen},
           last_seen,
           log_id,
           recovery_attempt,

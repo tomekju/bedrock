@@ -87,10 +87,11 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
 
     with {:ok, coordinator_nodes} <- cluster.fetch_coordinator_nodes(),
          true <- my_node in coordinator_nodes || {:error, :not_a_coordinator},
-         {:ok, raft_log} <- init_raft_log(cluster) do
-      # Load config and old TSL from object storage (source of truth)
-      {loaded_epoch, loaded_config, loaded_tsl} = load_state_from_object_storage(cluster)
-
+         {:ok, raft_log} <- init_raft_log(cluster),
+         {:ok, {loaded_epoch, loaded_config, loaded_old_tsl}} <-
+           load_state_from_object_storage(cluster) do
+      # PATCHED (fuu): fail closed when coordinator bootstrap cannot be proven.
+      # The only nil-config state is a backend-validated first boot.
       {:ok,
        %State{
          cluster: cluster,
@@ -99,7 +100,8 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
          supervisor_otp_name: cluster.otp_name(:sup),
          epoch: loaded_epoch,
          config: loaded_config,
-         transaction_system_layout: loaded_tsl,
+         old_transaction_system_layout: loaded_old_tsl,
+         transaction_system_layout: nil,
          raft:
            Raft.new(
              my_node,
@@ -112,6 +114,7 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
     else
       {:error, :unavailable} -> :ignore
       {:error, :not_a_coordinator} -> :ignore
+      {:error, reason} -> {:stop, {:bootstrap_load_failed, reason}}
     end
   end
 
@@ -133,7 +136,12 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
   @impl true
   def handle_call(:fetch_config, _from, t), do: reply(t, {:ok, t.config})
 
-  def handle_call(:fetch_transaction_system_layout, _from, t), do: reply(t, {:ok, t.transaction_system_layout})
+  def handle_call(:fetch_transaction_system_layout, _from, t) do
+    case t.transaction_system_layout do
+      nil -> reply(t, {:error, :unavailable})
+      transaction_system_layout -> reply(t, {:ok, transaction_system_layout})
+    end
+  end
 
   def handle_call({:register_services, services}, from, t) do
     caller_node = Node.self()
@@ -281,6 +289,7 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
     # Direct notification from Director - update state and broadcast to subscribers
     # No Raft consensus needed - TSL is persisted to object storage by Director
     t
+    |> Map.put(:old_transaction_system_layout, transaction_system_layout)
     |> put_transaction_system_layout(transaction_system_layout)
     |> put_epoch(transaction_system_layout.epoch)
     |> noreply()
@@ -434,23 +443,63 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
   # Object Storage loading functions
 
   @spec load_state_from_object_storage(module()) ::
-          {Bedrock.epoch() | nil, map() | nil, map() | nil}
+          {:ok, {Bedrock.epoch() | nil, map() | nil, map() | nil}} | {:error, term()}
   defp load_state_from_object_storage(cluster) do
-    with {:ok, backend} <- get_object_storage_backend(cluster),
-         {:ok, data} <- fetch_bootstrap_data(backend, cluster),
-         {:ok, bootstrap} <- parse_bootstrap_data(data, cluster) do
-      epoch = bootstrap.epoch
-      config = build_config_from_bootstrap(bootstrap, cluster)
-      old_tsl = build_old_tsl_from_bootstrap(bootstrap)
+    case get_object_storage_backend(cluster) do
+      {:ok, backend} ->
+        case fetch_bootstrap_data(backend, cluster) do
+          {:ok, data} ->
+            case parse_bootstrap_data(data, cluster) do
+              {:ok, bootstrap} ->
+                epoch = bootstrap.epoch
+                config = build_config_from_bootstrap(bootstrap, cluster)
+                old_tsl = build_old_tsl_from_bootstrap(bootstrap)
 
-      Logger.info("Bedrock [#{cluster}]: Loaded cluster bootstrap from object storage (epoch: #{epoch})")
-      {epoch, config, old_tsl}
-    else
-      {:error, :no_object_storage} -> {nil, nil, nil}
-      {:error, :not_found} -> {nil, nil, nil}
-      {:error, _reason} -> {nil, nil, nil}
+                Logger.info("Bedrock [#{cluster}]: Loaded cluster bootstrap from object storage (epoch: #{epoch})")
+                {:ok, {epoch, config, old_tsl}}
+
+              {:error, reason} ->
+                {:error, {:bootstrap_parse_failed, reason}}
+            end
+
+          {:error, :not_found} ->
+            admitted_first_boot_state(backend, cluster)
+
+          {:error, reason} ->
+            {:error, {:bootstrap_fetch_failed, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, {:object_storage_unavailable, reason}}
+    end
+  rescue
+    exception ->
+      {:error, {:bootstrap_load_exception, exception.__struct__, Exception.message(exception)}}
+  catch
+    :exit, reason -> {:error, {:bootstrap_load_exit, reason}}
+  end
+
+  defp admitted_first_boot_state(backend, cluster) do
+    case validated_first_boot_admission(backend, cluster) do
+      :ok -> {:ok, {nil, nil, nil}}
+      {:error, reason} -> {:error, {:bootstrap_missing_without_validated_first_boot_admission, reason}}
     end
   end
+
+  defp validated_first_boot_admission({module, config}, cluster) when is_atom(module) and is_list(config) do
+    if function_exported?(module, :first_boot_admission_status, 2) do
+      case module.first_boot_admission_status(config, cluster.node_config()) do
+        {:ok, :admitted} -> :ok
+        {:ok, :not_required} -> {:error, :first_boot_admission_not_validated}
+        {:error, reason} -> {:error, reason}
+        other -> {:error, {:invalid_first_boot_admission_status, other}}
+      end
+    else
+      {:error, :first_boot_admission_validator_missing}
+    end
+  end
+
+  defp validated_first_boot_admission(_backend, _cluster), do: {:error, :invalid_first_boot_admission_backend}
 
   defp fetch_bootstrap_data(backend, cluster) do
     case ObjectStorage.get(backend, "bootstrap") do
@@ -458,7 +507,10 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
         {:ok, data}
 
       {:error, :not_found} ->
-        Logger.info("Bedrock [#{cluster}]: No cluster bootstrap in object storage, starting fresh")
+        Logger.info(
+          "Bedrock [#{cluster}]: No cluster bootstrap in object storage; requiring validated first-boot admission"
+        )
+
         {:error, :not_found}
 
       {:error, reason} ->

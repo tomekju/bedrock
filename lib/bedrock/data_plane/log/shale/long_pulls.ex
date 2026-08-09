@@ -12,8 +12,10 @@ defmodule Bedrock.DataPlane.Log.Shale.LongPulls do
 
   @spec notify_waiting_pullers(WaitingList.t(), Bedrock.version(), Bedrock.transaction()) ::
           WaitingList.t()
-  def notify_waiting_pullers(waiting_pullers, version, transaction) do
-    {new_map, entries} = WaitingList.remove_all(waiting_pullers, version)
+  def notify_waiting_pullers(waiting_pullers, commit_version, transaction) do
+    # PATCHED (fuu): log pullers wait on a start-after cursor. A transaction at
+    # commit_version satisfies every waiter whose cursor is older than it.
+    {new_map, entries} = WaitingList.remove_all_less_than(waiting_pullers, commit_version)
 
     Enum.each(entries, fn {_deadline, reply_to_fn, _opts} ->
       reply_to_fn.({:ok, [transaction]})

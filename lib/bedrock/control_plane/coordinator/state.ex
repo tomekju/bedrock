@@ -24,6 +24,7 @@ defmodule Bedrock.ControlPlane.Coordinator.State do
           last_durable_txn_id: Raft.transaction_id(),
           config: Config.t() | nil,
           transaction_system_layout: TransactionSystemLayout.t() | nil,
+          old_transaction_system_layout: TransactionSystemLayout.t() | nil,
           waiting_list: %{Raft.transaction_id() => pid()},
           service_directory: %{String.t() => {atom(), {atom(), node()}}},
           node_capabilities: %{node() => [Cluster.capability()]},
@@ -42,6 +43,7 @@ defmodule Bedrock.ControlPlane.Coordinator.State do
             last_durable_txn_id: nil,
             config: nil,
             transaction_system_layout: nil,
+            old_transaction_system_layout: nil,
             waiting_list: %{},
             service_directory: %{},
             node_capabilities: %{},
@@ -108,7 +110,16 @@ defmodule Bedrock.ControlPlane.Coordinator.State do
     def update_service_directory(t, updater), do: %{t | service_directory: updater.(t.service_directory)}
 
     @spec add_tsl_subscriber(t :: State.t(), subscriber :: pid()) :: State.t()
-    def add_tsl_subscriber(t, subscriber), do: %{t | tsl_subscribers: MapSet.put(t.tsl_subscribers, subscriber)}
+    def add_tsl_subscriber(t, subscriber) do
+      updated_t = %{t | tsl_subscribers: MapSet.put(t.tsl_subscribers, subscriber)}
+
+      # PATCHED (fuu): replay current TSL to newly registered Link subscribers.
+      if updated_t.transaction_system_layout do
+        send(subscriber, {:tsl_updated, updated_t.transaction_system_layout})
+      end
+
+      updated_t
+    end
 
     @spec remove_tsl_subscriber(t :: State.t(), subscriber :: pid()) :: State.t()
     def remove_tsl_subscriber(t, subscriber), do: %{t | tsl_subscribers: MapSet.delete(t.tsl_subscribers, subscriber)}

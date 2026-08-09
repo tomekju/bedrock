@@ -29,7 +29,8 @@ defmodule Bedrock.ControlPlane.Coordinator.DirectorManagement do
   def try_to_start_director(t) when t.leader_node == t.my_node and t.director == :unavailable do
     t = maybe_put_default_config(t)
 
-    trace_director_launch(t.epoch, t.transaction_system_layout)
+    # PATCHED (fuu): pass recovery-only old TSL into Director, not client-visible current TSL.
+    trace_director_launch(t.epoch, t.old_transaction_system_layout)
 
     case start_director_with_monitoring(t) do
       {:ok, new_director} ->
@@ -49,7 +50,15 @@ defmodule Bedrock.ControlPlane.Coordinator.DirectorManagement do
   def try_to_start_director(t), do: t
 
   @spec maybe_put_default_config(State.t()) :: State.t()
-  defp maybe_put_default_config(%{config: nil} = t), do: put_config(t, Config.new(Bedrock.Raft.known_peers(t.raft)))
+  defp maybe_put_default_config(%{config: nil} = t) do
+    parameters =
+      t.cluster
+      |> apply(:node_config, [])
+      |> Keyword.get(:parameters, %{})
+
+    # PATCHED (fuu): pass the node durability parameters into fresh control-plane config.
+    put_config(t, Config.new(Bedrock.Raft.known_peers(t.raft), parameters))
+  end
 
   defp maybe_put_default_config(t), do: t
 
@@ -62,7 +71,7 @@ defmodule Bedrock.ControlPlane.Coordinator.DirectorManagement do
             [
               cluster: t.cluster,
               config: t.config,
-              old_transaction_system_layout: t.transaction_system_layout,
+              old_transaction_system_layout: t.old_transaction_system_layout,
               epoch: t.epoch,
               coordinator: self(),
               services: t.service_directory,

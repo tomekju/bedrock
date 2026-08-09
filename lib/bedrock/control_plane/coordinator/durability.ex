@@ -138,8 +138,13 @@ defmodule Bedrock.ControlPlane.Coordinator.Durability do
 
   def process_command(t, {:register_services, %{services: services}}) do
     update_service_directory(t, fn directory ->
-      Enum.into(services, directory, fn {service_id, kind, worker_ref} ->
-        {service_id, {kind, worker_ref}}
+      Enum.into(services, directory, fn
+        {service_id, {:materializer, shard_id}, worker_ref} ->
+          # PATCHED (fuu): store materializer shard assignments in service directory.
+          {service_id, {:materializer, worker_ref, shard_id}}
+
+        {service_id, kind, worker_ref} ->
+          {service_id, {kind, worker_ref}}
       end)
     end)
   end

@@ -19,7 +19,9 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
 
   # Transaction count limits for adaptive batching
   # Small batches for responsiveness during normal operation
-  @continuation_batch_count 5
+  # PATCHED (fuu): match recovery pull batch size so cold materializer catchup
+  # does not starve behind thousands of tiny apply continuations.
+  @continuation_batch_count 100
   # Larger batches during lulls when no reads are waiting
   @timeout_batch_count 50
 
@@ -30,13 +32,15 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
     id = opts[:id] || raise "Missing :id option"
     path = opts[:path] || raise "Missing :path option"
     cluster = opts[:cluster]
+    object_storage = opts[:object_storage]
     params = opts[:params] || %{}
     shard_id = params["shard_id"]
 
     # Build startup opts only if cluster and shard_id are provided
     startup_opts =
       if cluster && shard_id do
-        [cluster: cluster, shard_id: shard_id]
+        # PATCHED (fuu): pass Foreman object storage through to Olivine startup.
+        [cluster: cluster, shard_id: shard_id, object_storage: object_storage]
       else
         []
       end
@@ -124,6 +128,15 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
   def handle_call({:unlock_after_recovery, durable_version, transaction_system_layout}, {_director, _}, t) do
     {:ok, updated_state} = Logic.unlock_after_recovery(t, durable_version, transaction_system_layout)
     reply(updated_state, :ok)
+  end
+
+  @impl true
+  def handle_call({:force_durable_checkpoint, target_version}, _from, %State{} = t) do
+    # PATCHED (fuu): force a recovery durable checkpoint after read catchup.
+    case Logic.force_durable_checkpoint(t, target_version) do
+      {:ok, updated_state} -> reply(updated_state, :ok)
+      {:error, reason} -> reply(t, {:error, reason})
+    end
   end
 
   @impl true
@@ -220,6 +233,20 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
   @impl true
   # Discard transactions when locked
   def handle_info({:apply_transactions, _encoded_transactions}, %State{mode: :locked} = t), do: noreply(t)
+
+  @impl true
+  def handle_info({:apply_transactions, _encoded_transactions, caller, ref}, %State{mode: :locked} = t) do
+    send(caller, {:transactions_applied, ref, nil})
+    noreply(t)
+  end
+
+  # PATCHED (fuu): support back-pressure from the puller during recovery catchup.
+  def handle_info({:apply_transactions, encoded_transactions, caller, ref}, %State{} = t) do
+    {:ok, state_with_txns, version} = Logic.apply_transactions(t, encoded_transactions)
+    final_state = notify_waiting_fetches(state_with_txns, version)
+    send(caller, {:transactions_applied, ref, version})
+    noreply(final_state, continue: :maybe_process_transactions)
+  end
 
   @impl true
   def handle_info({:apply_transactions, encoded_transactions}, %State{} = t) do

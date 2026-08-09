@@ -16,6 +16,7 @@ defmodule Bedrock.Service.Foreman.Impl do
   alias Bedrock.Cluster
   alias Bedrock.Cluster.Link
   alias Bedrock.ControlPlane.Coordinator
+  alias Bedrock.ObjectStorage.Keys
   alias Bedrock.Service.Foreman.State
   alias Bedrock.Service.Foreman.WorkerInfo
   alias Bedrock.Service.Worker
@@ -35,11 +36,12 @@ defmodule Bedrock.Service.Foreman.Impl do
     |> Enum.map(fn {_id, worker_info} -> compact_service_info_from_worker_info(worker_info) end)
   end
 
-  @spec do_new_worker(State.t(), Worker.id(), :log | :materializer) :: {State.t(), Worker.ref()}
-  def do_new_worker(t, id, kind) do
+  @spec do_new_worker(State.t(), Worker.id(), :log | :materializer, map()) :: {State.t(), Worker.ref()}
+  def do_new_worker(t, id, kind, params) do
     worker_info =
       id
-      |> initialize_new_worker(worker_for_kind(kind), %{}, t.path, t.cluster)
+      # PATCHED (fuu): initialize new workers with persisted params.
+      |> initialize_new_worker(worker_for_kind(kind), params, t.path, t.cluster)
       |> try_to_start_worker(t.cluster, t.object_storage)
       |> advertise_running_worker(t.cluster)
 
@@ -109,23 +111,23 @@ defmodule Bedrock.Service.Foreman.Impl do
   end
 
   @spec advertise_running_worker(WorkerInfo.t(), module()) :: WorkerInfo.t()
-  def advertise_running_worker(%{health: {:ok, pid}} = worker_info, cluster) do
+  def advertise_running_worker(%{health: {:ok, _pid}} = worker_info, cluster) do
     # Get coordinator from link
     link = cluster.otp_name(:link)
 
-    case Link.fetch_coordinator(link) do
-      {:ok, coordinator} ->
-        # Get worker info and register directly with coordinator
-        case Worker.info(pid, [:id, :otp_name, :kind, :pid]) do
-          {:ok, info} ->
-            service_info = {info[:id], info[:kind], {info[:otp_name], Node.self()}}
-            Coordinator.register_services(coordinator, [service_info])
+    try do
+      case Link.fetch_coordinator(link) do
+        {:ok, coordinator} ->
+          # PATCHED (fuu): advertise materializer shard assignments from
+          # persisted worker params so recovery can reuse shard-tagged workers.
+          Coordinator.register_services(coordinator, [service_info_from_worker_info(worker_info)])
 
-          _ ->
-            :ok
-        end
-
-      _ ->
+        _ ->
+          :ok
+      end
+    catch
+      :exit, _reason ->
+        # PATCHED (fuu): tolerate Link startup timeout during Foreman advertisement.
         :ok
     end
 
@@ -273,10 +275,19 @@ defmodule Bedrock.Service.Foreman.Impl do
   end
 
   @spec service_info_from_worker_info(WorkerInfo.t()) ::
-          {String.t(), :log | :materializer, {atom(), node()}}
-  def service_info_from_worker_info(%{id: id, manifest: %{worker: worker}, otp_name: otp_name}) do
+          {String.t(), :log | :materializer | {:materializer, non_neg_integer()}, {atom(), node()}}
+  def service_info_from_worker_info(%{id: id, manifest: %{worker: worker} = manifest, otp_name: otp_name}) do
     kind = worker.kind()
     worker_ref = {otp_name, Node.self()}
-    {id, kind, worker_ref}
+    {id, advertised_kind(kind, manifest), worker_ref}
   end
+
+  defp advertised_kind(:materializer, %{params: %{"shard_id" => shard_tag}}) do
+    case Keys.parse_shard_tag(shard_tag) do
+      {:ok, shard_id} -> {:materializer, shard_id}
+      {:error, :invalid_format} -> :materializer
+    end
+  end
+
+  defp advertised_kind(kind, _manifest), do: kind
 end

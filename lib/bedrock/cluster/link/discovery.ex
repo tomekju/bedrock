@@ -207,5 +207,9 @@ defmodule Bedrock.Cluster.Link.Discovery do
     end
   rescue
     _ -> []
+  catch
+    :exit, _reason ->
+      # PATCHED (fuu): tolerate Foreman startup timeout during Link discovery.
+      []
   end
 end

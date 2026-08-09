@@ -38,10 +38,12 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhase do
 
   @impl true
   def execute(recovery_attempt, context) do
-    # Only copy transactions from durable_version onwards (what storage actually needs)
-    # instead of copying from the beginning of the version vector
-    {_original_first, last_version} = recovery_attempt.version_vector
-    optimized_version_vector = {recovery_attempt.durable_version, last_version}
+    # PATCHED (fuu): replacement materializers may start below the planned
+    # recovery durable version when no snapshot exists, so replay from the lower
+    # of the original version vector and durable version.
+    {original_first, last_version} = recovery_attempt.version_vector
+    replay_first_version = min_version(original_first, recovery_attempt.durable_version)
+    optimized_version_vector = {replay_first_version, last_version}
 
     # Get survivor log IDs - all logs that were successfully locked during recovery
     survivor_log_ids = Map.get(recovery_attempt, :survivor_log_ids, recovery_attempt.old_log_ids_to_copy)
@@ -138,6 +140,9 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhase do
   def replay_old_logs_into_new_logs(old_log_ids, new_log_ids, version_vector, recovery_attempt, context \\ %{}) do
     replay_into_new_logs(old_log_ids, new_log_ids, version_vector, recovery_attempt, context)
   end
+
+  defp min_version(left, right) when is_binary(left) and is_binary(right) and left <= right, do: left
+  defp min_version(left, right) when is_binary(left) and is_binary(right), do: right
 
   @doc """
   Copies transaction data from survivor logs to a new log.

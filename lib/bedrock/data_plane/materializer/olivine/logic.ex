@@ -10,12 +10,14 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Logic do
   alias Bedrock.DataPlane.Materializer.Olivine.CompactionWriter.SplitFile, as: SplitFileWriter
   alias Bedrock.DataPlane.Materializer.Olivine.Database
   alias Bedrock.DataPlane.Materializer.Olivine.IndexManager
+  alias Bedrock.DataPlane.Materializer.Olivine.IntakeQueue
   alias Bedrock.DataPlane.Materializer.Olivine.Pulling
   alias Bedrock.DataPlane.Materializer.Olivine.State
   alias Bedrock.DataPlane.Materializer.Olivine.Telemetry, as: OlivineTelemetry
   alias Bedrock.DataPlane.Materializer.Telemetry
   alias Bedrock.DataPlane.Transaction
   alias Bedrock.DataPlane.Version
+  alias Bedrock.ObjectStorage
   alias Bedrock.ObjectStorage.Config, as: ObjectStorageConfig
   alias Bedrock.ObjectStorage.Snapshot
   alias Bedrock.ObjectStorage.SnapshotBundle
@@ -30,32 +32,82 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Logic do
   def startup(otp_name, foreman, id, path, opts \\ []) do
     cluster = Keyword.get(opts, :cluster)
     shard_id = Keyword.get(opts, :shard_id)
-    snapshot = build_snapshot_handle(cluster, shard_id)
+    object_storage = Keyword.get(opts, :object_storage)
+    snapshot = build_snapshot_handle(cluster, shard_id, object_storage)
 
     with :ok <- ensure_directory_exists(path),
-         :ok <- maybe_load_snapshot(path, snapshot),
-         {:ok, database} <- Database.open(:"#{otp_name}_db", Path.join(path, "dets"), opts),
-         {:ok, index_manager} <- IndexManager.recover_from_database(database) do
-      {:ok,
-       %State{
-         path: path,
-         otp_name: otp_name,
-         id: id,
-         shard_id: shard_id,
-         foreman: foreman,
-         database: database,
-         index_manager: index_manager,
-         snapshot: snapshot
-       }}
+         {:ok, snapshotless_admission} <- prepare_snapshot_for_startup(path, snapshot),
+         {:ok, database, index_manager} <-
+           open_and_recover_database(otp_name, path, opts) do
+      complete_startup(
+        otp_name,
+        foreman,
+        id,
+        path,
+        shard_id,
+        database,
+        index_manager,
+        snapshot,
+        snapshotless_admission
+      )
     end
   end
 
-  @spec build_snapshot_handle(cluster :: module() | nil, shard_id :: String.t() | nil) :: Snapshot.t() | nil
-  defp build_snapshot_handle(nil, _shard_id), do: nil
-  defp build_snapshot_handle(_cluster, nil), do: nil
+  defp open_and_recover_database(otp_name, path, opts) do
+    case Database.open(:"#{otp_name}_db", Path.join(path, "dets"), opts) do
+      {:ok, database} ->
+        case IndexManager.recover_from_database(database) do
+          {:ok, index_manager} ->
+            {:ok, database, index_manager}
 
-  defp build_snapshot_handle(_cluster, shard_id) do
-    backend = ObjectStorageConfig.backend()
+          {:error, _reason} = error ->
+            :ok = Database.close(database)
+            error
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp complete_startup(
+         otp_name,
+         foreman,
+         id,
+         path,
+         shard_id,
+         database,
+         index_manager,
+         snapshot,
+         snapshotless_admission
+       ) do
+    case acknowledge_initial_snapshotless_token(snapshotless_admission) do
+      :ok ->
+        {:ok,
+         %State{
+           path: path,
+           otp_name: otp_name,
+           id: id,
+           shard_id: shard_id,
+           foreman: foreman,
+           database: database,
+           index_manager: index_manager,
+           snapshot: snapshot
+         }}
+
+      {:error, _reason} = error ->
+        :ok = Database.close(database)
+        error
+    end
+  end
+
+  @spec build_snapshot_handle(module() | nil, String.t() | nil, ObjectStorage.backend() | nil) ::
+          Snapshot.t() | nil
+  defp build_snapshot_handle(nil, _shard_id, _object_storage), do: nil
+  defp build_snapshot_handle(_cluster, nil, _object_storage), do: nil
+
+  defp build_snapshot_handle(_cluster, shard_id, object_storage) do
+    backend = object_storage || ObjectStorageConfig.backend()
     Snapshot.new(backend, shard_id)
   end
 
@@ -64,9 +116,16 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Logic do
   restore from the latest snapshot in ObjectStorage.
   """
   @spec maybe_load_snapshot(Path.t(), Snapshot.t() | nil) :: :ok | {:error, term()}
-  def maybe_load_snapshot(_path, nil), do: :ok
+  def maybe_load_snapshot(path, snapshot) do
+    case prepare_snapshot_for_startup(path, snapshot) do
+      {:ok, _snapshotless_admission} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
 
-  def maybe_load_snapshot(path, %Snapshot{} = snapshot) do
+  defp prepare_snapshot_for_startup(_path, nil), do: {:ok, nil}
+
+  defp prepare_snapshot_for_startup(path, %Snapshot{} = snapshot) do
     # Database.open uses Path.dirname(file_path) and creates data/idx files there
     # We pass Path.join(path, "dets") to Database.open, so files are at path/data, path/idx
     data_path = Path.join(path, "data")
@@ -74,14 +133,15 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Logic do
 
     if File.exists?(data_path) and File.exists?(idx_path) do
       # Local files exist - use them (warm start)
-      :ok
+      {:ok, nil}
     else
       # Cold start - discover and download from ObjectStorage
       load_snapshot_from_object_storage(path, snapshot)
     end
   end
 
-  @spec load_snapshot_from_object_storage(Path.t(), Snapshot.t()) :: :ok | {:error, term()}
+  @spec load_snapshot_from_object_storage(Path.t(), Snapshot.t()) ::
+          {:ok, term() | nil} | {:error, term()}
   defp load_snapshot_from_object_storage(path, snapshot) do
     bundle_path = Path.join(path, "snapshot.bundle")
     data_path = Path.join(path, "data")
@@ -92,16 +152,106 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Logic do
          :ok <- File.write(bundle_path, data),
          {:ok, _, _} <- SnapshotBundle.split_in_place(bundle_path, data_path, idx_path) do
       Logger.info("Discovered and loaded snapshot from ObjectStorage", version: version)
-      :ok
+      {:ok, nil}
     else
       {:error, :not_found} ->
-        # No snapshot discovered - proceed with empty state
-        Logger.info("No snapshot discovered in ObjectStorage, starting fresh")
-        :ok
+        case allow_missing_snapshot_for_pristine_first_boot?(
+               snapshot.backend,
+               snapshot.shard_tag
+             ) do
+          {:ok, snapshotless_admission} ->
+            # PATCHED (fuu): namespace-scoped cold starts require one-time pristine admission.
+            Logger.info("No snapshot discovered in ObjectStorage during admitted first boot")
+            {:ok, snapshotless_admission}
+
+          {:error, reason} ->
+            {:error, {:snapshot_missing_without_pristine_first_boot, reason}}
+        end
 
       {:error, reason} ->
         {:error, {:snapshot_load_failed, reason}}
     end
+  end
+
+  @initial_snapshotless_token_version 1
+
+  defp allow_missing_snapshot_for_pristine_first_boot?({module, config} = backend, shard_tag)
+       when is_atom(module) and is_list(config) and is_binary(shard_tag) do
+    if Keyword.get(config, :require_pristine_first_boot?, false) do
+      read_initial_snapshotless_token(backend, shard_tag)
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp allow_missing_snapshot_for_pristine_first_boot?(_backend, _shard_tag), do: {:ok, nil}
+
+  defp read_initial_snapshotless_token(backend, shard_tag) do
+    key = initial_snapshotless_token_key(shard_tag)
+
+    case ObjectStorage.get_with_version(backend, key) do
+      {:ok, data, version_token} ->
+        case decode_initial_snapshotless_token(data, shard_tag) do
+          {:ok, token} -> {:ok, {backend, key, version_token, token}}
+          {:error, _reason} = error -> error
+        end
+
+      {:error, :not_found} ->
+        {:error, :initial_snapshotless_token_missing}
+
+      {:error, reason} ->
+        {:error, {:initial_snapshotless_token_unreadable, reason}}
+    end
+  end
+
+  defp acknowledge_initial_snapshotless_token(nil), do: :ok
+
+  defp acknowledge_initial_snapshotless_token({backend, key, version_token, token}) do
+    # PATCHED (fuu): acknowledge snapshotless token only after database recovery.
+    # PATCHED (fuu): consume a one-time initial materializer snapshot token.
+    consume_initial_snapshotless_token(backend, key, version_token, token)
+  end
+
+  defp consume_initial_snapshotless_token(backend, key, version_token, token) do
+    consumed = %{token | state: :consumed}
+
+    case ObjectStorage.put_if_version_matches(
+           backend,
+           key,
+           version_token,
+           :erlang.term_to_binary(consumed)
+         ) do
+      :ok -> :ok
+      {:error, :version_mismatch} -> {:error, :initial_snapshotless_token_consumed}
+      {:error, :not_found} -> {:error, :initial_snapshotless_token_missing}
+      {:error, reason} -> {:error, {:initial_snapshotless_token_consume_failed, reason}}
+    end
+  end
+
+  defp decode_initial_snapshotless_token(data, shard_tag) when is_binary(data) do
+    case :erlang.binary_to_term(data, [:safe]) do
+      %{
+        kind: :initial_snapshotless_materializer,
+        version: @initial_snapshotless_token_version,
+        shard_tag: ^shard_tag,
+        state: :issued
+      } = token ->
+        {:ok, token}
+
+      %{kind: :initial_snapshotless_materializer, shard_tag: ^shard_tag, state: :consumed} ->
+        {:error, :initial_snapshotless_token_consumed}
+
+      _other ->
+        {:error, :invalid_initial_snapshotless_token}
+    end
+  rescue
+    ArgumentError -> {:error, :invalid_initial_snapshotless_token}
+  end
+
+  defp decode_initial_snapshotless_token(_data, _shard_tag), do: {:error, :invalid_initial_snapshotless_token}
+
+  defp initial_snapshotless_token_key(shard_tag) do
+    "foundation/initial_materializer/" <> Base.url_encode64(shard_tag, padding: false)
   end
 
   @spec ensure_directory_exists(Path.t()) :: :ok | {:error, File.posix()}
@@ -140,9 +290,26 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Logic do
     main_process_pid = self()
 
     apply_and_notify_fn = fn transactions ->
-      send(main_process_pid, {:apply_transactions, transactions})
       last_transaction = List.last(transactions)
-      Transaction.commit_version!(last_transaction)
+      expected_version = Transaction.commit_version!(last_transaction)
+      ref = make_ref()
+      send(main_process_pid, {:apply_transactions, transactions, self(), ref})
+
+      # PATCHED (fuu): apply pulled transactions with back-pressure so recovery
+      # catchup cannot outrun Olivine indexing.
+      receive do
+        {:transactions_applied, ^ref, version}
+        when is_binary(version) and version >= expected_version ->
+          version
+
+        {:transactions_applied, ^ref, version} ->
+          # PATCHED (fuu): require apply ACK before advancing puller.
+          raise "Materializer applied pulled transactions only through #{inspect(version)}, expected at least #{inspect(expected_version)}"
+      after
+        60_000 ->
+          # PATCHED (fuu): require apply ACK before advancing puller.
+          raise "Timed out waiting for materializer to apply pulled transactions through #{inspect(expected_version)}"
+      end
     end
 
     database = t.database
@@ -154,7 +321,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Logic do
         logs,
         services,
         apply_and_notify_fn,
-        fn -> Database.load_current_durable_version(database) end
+        fn -> current_durable_version(database) end
       )
 
     t
@@ -177,8 +344,14 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Logic do
   end
 
   defp supported_info, do: ~w[
+      current_version
       durable_version
+      intake_queue_size
+      mode
       oldest_durable_version
+      pull_task
+      pull_task_alive?
+      shard_id
       id
       pid
       path
@@ -191,8 +364,15 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Logic do
       utilization
     ]a
 
+  defp gather_info(:current_version, t), do: t.index_manager.current_version
   defp gather_info(:oldest_durable_version, t), do: Database.durable_version(t.database)
   defp gather_info(:durable_version, t), do: Database.durable_version(t.database)
+  defp gather_info(:intake_queue_size, t), do: IntakeQueue.size(t.intake_queue)
+  defp gather_info(:mode, t), do: t.mode
+  defp gather_info(:pull_task, t), do: t.pull_task
+  defp gather_info(:pull_task_alive?, %{pull_task: nil}), do: false
+  defp gather_info(:pull_task_alive?, %{pull_task: %Task{pid: pid}}), do: Process.alive?(pid)
+  defp gather_info(:shard_id, t), do: t.shard_id
   defp gather_info(:id, t), do: t.id
   defp gather_info(:key_ranges, t), do: IndexManager.info(t.index_manager, :key_ranges)
   defp gather_info(:kind, _t), do: :materializer
@@ -205,7 +385,71 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Logic do
   defp gather_info(:utilization, t), do: IndexManager.info(t.index_manager, :utilization)
   defp gather_info(_unsupported, _t), do: {:error, :unsupported_info}
 
+  defp current_durable_version(database) do
+    # PATCHED (fuu): expose a binary durable version to log subscribers.
+    case Database.load_current_durable_version(database) do
+      {:ok, version} when is_binary(version) -> version
+      _ -> Database.durable_version(database)
+    end
+  end
+
   defp max_eviction_size, do: 10 * 1024 * 1024
+
+  @doc """
+  Forces durable advancement through a recovery target after read catch-up.
+  """
+  @spec force_durable_checkpoint(State.t(), Bedrock.version()) ::
+          {:ok, State.t()} | {:error, term()}
+  def force_durable_checkpoint(%State{} = state, target_version) when is_binary(target_version) do
+    durable_version = Database.durable_version(state.database)
+
+    cond do
+      durable_version >= target_version ->
+        {:ok, state}
+
+      state.index_manager.current_version < target_version ->
+        {:error, :version_too_new}
+
+      true ->
+        force_durable_checkpoint_to_target(state, target_version)
+    end
+  end
+
+  defp force_durable_checkpoint_to_target(%State{} = state, target_version) do
+    case IndexManager.checkpoint_snapshot(state.index_manager, target_version) do
+      {:ok, updated_index_manager, checkpoint_pages} ->
+        {data_db, _index_db} = state.database
+
+        case Database.advance_durable_version(
+               state.database,
+               target_version,
+               target_version,
+               data_db.file_offset,
+               [checkpoint_pages]
+             ) do
+          {:ok, updated_database, _db_pipeline} ->
+            durable_version = Database.durable_version(updated_database)
+
+            updated_state = %{
+              state
+              | index_manager: updated_index_manager,
+                database: updated_database
+            }
+
+            if durable_version >= target_version do
+              {:ok, updated_state}
+            else
+              {:error, {:durable_checkpoint_unavailable, durable_version, target_version}}
+            end
+
+          {:error, reason} ->
+            {:error, {:durable_version_advance_failed, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
 
   @doc """
   Performs window advancement by delegating policy decisions to IndexManager and handling persistence.

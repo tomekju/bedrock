@@ -133,7 +133,10 @@ defmodule Bedrock.DataPlane.Materializer.Basalt.Logic do
 
   @spec notify_waiting_fetches(State.t(), Bedrock.version()) :: State.t()
   def notify_waiting_fetches(%State{} = t, applied_version) do
-    {new_waiting, notified_entries} = WaitingList.remove_all(t.waiting_fetches, applied_version)
+    # PATCHED (fuu): applying through a version makes all lower/equal read
+    # versions serveable, not just waiters for the exact applied version.
+    {new_waiting, notified_entries} =
+      WaitingList.remove_all_less_than(t.waiting_fetches, Version.increment(applied_version))
 
     Enum.each(notified_entries, fn {_deadline, reply_fn, {key, version}} ->
       case Database.fetch(t.database, key, version) do

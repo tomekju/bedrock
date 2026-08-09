@@ -150,10 +150,11 @@ defmodule Bedrock.ControlPlane.Director.Recovery.TopologyPhase do
   end
 
   defp extract_service_ids(recovery_attempt) do
-    # Only log services - storage teams are retired
-    recovery_attempt.logs
+    # PATCHED (fuu): include materializer services in published topology.
+    recovery_attempt.transaction_services
     |> Map.keys()
     |> MapSet.new()
+    |> MapSet.union(MapSet.new(Map.keys(recovery_attempt.logs)))
   end
 
   @spec build_service_descriptor(
@@ -162,6 +163,17 @@ defmodule Bedrock.ControlPlane.Director.Recovery.TopologyPhase do
           RecoveryPhase.context()
         ) :: ServiceDescriptor.t() | nil
   defp build_service_descriptor(service_id, recovery_attempt, context) do
+    # PATCHED (fuu): prefer current recovery transaction services for newly recruited logs.
+    case Map.get(recovery_attempt.transaction_services, service_id) do
+      %{kind: kind, last_seen: last_seen, status: status} ->
+        %{kind: kind, last_seen: last_seen, status: status}
+
+      _ ->
+        build_service_descriptor_from_available(service_id, recovery_attempt, context)
+    end
+  end
+
+  defp build_service_descriptor_from_available(service_id, recovery_attempt, context) do
     case Map.get(context.available_services, service_id) do
       {kind, last_seen} = _service ->
         status = determine_service_status(service_id, recovery_attempt.service_pids)
@@ -173,7 +185,6 @@ defmodule Bedrock.ControlPlane.Director.Recovery.TopologyPhase do
         }
 
       _ ->
-        # Service not found in available services
         nil
     end
   end
@@ -281,7 +292,12 @@ defmodule Bedrock.ControlPlane.Director.Recovery.TopologyPhase do
     with :ok <- validate_sequencer(recovery_attempt.sequencer),
          :ok <- validate_commit_proxies(recovery_attempt.proxies),
          :ok <- validate_resolvers(recovery_attempt.resolvers),
-         :ok <- validate_logs(recovery_attempt.logs, recovery_attempt.transaction_services) do
+         :ok <- validate_logs(recovery_attempt.logs, recovery_attempt.transaction_services),
+         :ok <-
+           validate_materializer_services(
+             recovery_attempt.shard_materializers,
+             recovery_attempt.transaction_services
+           ) do
       :ok
     else
       {:error, reason} -> {:error, {:invalid_recovery_state, reason}}
@@ -322,6 +338,33 @@ defmodule Bedrock.ControlPlane.Director.Recovery.TopologyPhase do
       {:error, :invalid_resolvers}
     end
   end
+
+  defp validate_materializer_services(shard_materializers, transaction_services)
+       when is_map(shard_materializers) and map_size(shard_materializers) > 0 do
+    materializer_services =
+      Enum.filter(transaction_services, fn
+        {_service_id, %{kind: :materializer, status: {:up, pid}}} when is_pid(pid) -> true
+        _service -> false
+      end)
+
+    missing_services =
+      shard_materializers
+      |> Map.values()
+      |> Enum.reject(fn materializer_pid ->
+        Enum.any?(materializer_services, fn
+          {_service_id, %{status: {:up, service_pid}}} -> service_pid == materializer_pid
+          _service -> false
+        end)
+      end)
+
+    case missing_services do
+      [] -> :ok
+      missing -> {:error, {:missing_materializer_services, Enum.map(missing, &inspect/1)}}
+    end
+  end
+
+  defp validate_materializer_services(_shard_materializers, _transaction_services),
+    do: {:error, :no_shard_materializers}
 
   @spec validate_logs(%{Log.id() => LogDescriptor.t()}, %{Worker.id() => ServiceDescriptor.t()}) ::
           :ok | {:error, {:missing_log_services, [binary()]}}

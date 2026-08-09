@@ -17,10 +17,17 @@ defmodule Bedrock.DataPlane.Materializer do
   @type key_range :: Bedrock.key_range()
   @type fact_name ::
           Worker.fact_name()
+          # PATCHED (fuu): expose recovery diagnostic materializer info facts.
+          | :current_version
+          | :intake_queue_size
           | :key_ranges
           | :durable_version
+          | :mode
           | :n_objects
           | :path
+          | :pull_task
+          | :pull_task_alive?
+          | :shard_id
           | :size_in_bytes
           | :utilization
 
@@ -311,6 +318,29 @@ defmodule Bedrock.DataPlane.Materializer do
           %{materializer_id: storage, durable_version: durable_version, exit_reason: reason}
         )
 
+        {:failure, :unavailable, storage}
+    end
+  end
+
+  @doc false
+  @spec force_durable_checkpoint(
+          storage :: ref(),
+          target_version :: Bedrock.version(),
+          opts :: [timeout_in_ms: Bedrock.timeout_in_ms()]
+        ) :: :ok | {:error, term()} | {:failure, :timeout | :unavailable, ref()}
+  def force_durable_checkpoint(storage, target_version, opts \\ []) do
+    timeout = opts[:timeout_in_ms] || :infinity
+
+    try do
+      # PATCHED (fuu): expose recovery durable checkpoint control so recovery
+      # does not publish a materializer that can serve reads only from volatile
+      # current_version state.
+      GenServer.call(storage, {:force_durable_checkpoint, target_version}, timeout)
+    catch
+      :exit, {:timeout, _} ->
+        {:failure, :timeout, storage}
+
+      :exit, _reason ->
         {:failure, :unavailable, storage}
     end
   end

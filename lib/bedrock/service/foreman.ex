@@ -27,10 +27,13 @@ defmodule Bedrock.Service.Foreman do
           foreman :: ref(),
           id :: Worker.id(),
           kind :: :log | :materializer,
-          opts :: [timeout: timeout()]
+          opts :: [timeout: timeout(), params: map()]
         ) ::
           {:ok, Worker.ref()} | {:error, :timeout}
-  def new_worker(foreman, id, kind, opts \\ []), do: call(foreman, {:new_worker, id, kind}, opts[:timeout] || :infinity)
+  def new_worker(foreman, id, kind, opts \\ []) do
+    # PATCHED (fuu): persist worker params in manifest.
+    call(foreman, {:new_worker, id, kind, opts[:params] || %{}}, opts[:timeout] || :infinity)
+  end
 
   @doc """
   Return a list of running materializer workers only.

@@ -43,7 +43,9 @@ defmodule Bedrock.ControlPlane.Coordinator.Commands do
              service_ids: [String.t()]
            }}
 
-  @type service_info :: {service_id :: String.t(), kind :: atom(), worker_ref :: {atom(), node()}}
+  @type service_info ::
+          {service_id :: String.t(), kind :: atom() | {:materializer, non_neg_integer()},
+           worker_ref :: {atom(), node()}}
 
   @doc """
   Create a command to end the previous epoch via consensus.
@@ -97,9 +99,14 @@ defmodule Bedrock.ControlPlane.Coordinator.Commands do
       when is_binary(service_id) and is_atom(kind) and is_atom(name) and is_atom(service_node) ->
         :ok
 
+      {service_id, {:materializer, shard_id}, {name, service_node}}
+      when is_binary(service_id) and is_integer(shard_id) and shard_id >= 0 and is_atom(name) and
+             is_atom(service_node) ->
+        :ok
+
       invalid ->
         raise ArgumentError,
-              "Invalid service info: #{inspect(invalid)}. Expected {service_id, kind, {name, node}}"
+              "Invalid service info: #{inspect(invalid)}. Expected {service_id, kind | {:materializer, shard_id}, {name, node}}"
     end)
 
     {

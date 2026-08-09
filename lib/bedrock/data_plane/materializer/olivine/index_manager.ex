@@ -477,6 +477,38 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexManager do
     end
   end
 
+  @doc """
+  Builds a full durable checkpoint snapshot for a recovery target version.
+  """
+  @spec checkpoint_snapshot(t(), Bedrock.version()) ::
+          {:ok, t(), modified_pages()} | {:error, :version_too_new | :version_too_old}
+  def checkpoint_snapshot(%{current_version: current_version}, target_version) when current_version < target_version,
+    do: {:error, :version_too_new}
+
+  def checkpoint_snapshot(index_manager, target_version) when is_binary(target_version) do
+    case checkpoint_version_entry(index_manager.versions, target_version) do
+      {^target_version, {checkpoint_index, _modified_pages}} ->
+        checkpoint_pages = checkpoint_index.page_map
+
+        updated_index_manager = %{
+          index_manager
+          | output_queue: :queue.new(),
+            versions: [{target_version, {checkpoint_index, %{}}}]
+        }
+
+        {:ok, updated_index_manager, checkpoint_pages}
+
+      nil ->
+        {:error, :version_too_old}
+    end
+  end
+
+  defp checkpoint_version_entry([{target_version, _} = entry | _rest], target_version), do: entry
+
+  defp checkpoint_version_entry([_entry | rest], target_version), do: checkpoint_version_entry(rest, target_version)
+
+  defp checkpoint_version_entry([], _target_version), do: nil
+
   defp split_versions([{version, _data} = entry | rest], target, kept_versions) when version >= target,
     do: split_versions(rest, target, [entry | kept_versions])
 

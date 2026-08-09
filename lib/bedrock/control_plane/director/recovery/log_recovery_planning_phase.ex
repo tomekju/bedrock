@@ -45,12 +45,17 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogRecoveryPlanningPhase do
 
           durable_version = calculate_durable_version(log_recovery_info)
 
+          # PATCHED (fuu): seed fresh replacement log vacancies for persisted recovery.
+          log_vacancies = Enum.map(1..context.cluster_config.parameters.desired_logs, &{:vacancy, &1})
+          logs = Map.new(log_vacancies, &{&1, []})
+
           updated_recovery_attempt =
             recovery_attempt
             |> Map.put(:old_log_ids_to_copy, survivor_ids)
             |> Map.put(:survivor_log_ids, survivor_ids)
             |> Map.put(:version_vector, version_vector)
             |> Map.put(:durable_version, durable_version)
+            |> Map.put(:logs, logs)
 
           {updated_recovery_attempt, Bedrock.ControlPlane.Director.Recovery.LogRecruitmentPhase}
 

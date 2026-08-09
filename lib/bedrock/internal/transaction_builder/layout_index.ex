@@ -156,6 +156,8 @@ defmodule Bedrock.Internal.TransactionBuilder.LayoutIndex do
       ranges
       |> Enum.flat_map(fn {start_key, end_key, _pids} -> [start_key, end_key] end)
       |> Enum.sort()
+      # PATCHED (fuu): gb_trees.from_orddict/1 requires sorted, duplicate-free segment keys.
+      |> Enum.uniq()
 
     boundaries
     |> Enum.chunk_every(2, 1, :discard)
@@ -175,7 +177,12 @@ defmodule Bedrock.Internal.TransactionBuilder.LayoutIndex do
 
   @spec build_tree_from_segments([{binary(), {binary(), [pid()]}}]) ::
           :gb_trees.tree(binary(), {binary(), [pid()]})
-  defp build_tree_from_segments(orddict), do: :gb_trees.from_orddict(orddict)
+  defp build_tree_from_segments(segments) do
+    segments
+    # PATCHED (fuu): normalize recovered layouts before building the gb_tree index.
+    |> Enum.sort_by(fn {end_key, _segment} -> end_key end)
+    |> :gb_trees.from_orddict()
+  end
 
   @spec segment_for_key(:gb_trees.tree(binary(), {binary(), [pid()]}), binary()) ::
           {:ok, {binary(), binary()}, [pid()]} | :not_found
