@@ -100,11 +100,12 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhaseTest 
 
       log =
         capture_log(fn ->
-          assert {_attempt, {:stalled, :no_materializer_capable_nodes}} =
+          assert {_attempt, {:stalled, {:materializer_unavailable, :waiting_for_tagged_materializer}}} =
                    MaterializerBootstrapPhase.execute(recovery_attempt, context)
         end)
 
-      assert log =~ "System shard materializer not found, creating new one"
+      assert log =~ "waiting for tagged shard"
+      refute log =~ "System shard materializer not found, creating new one"
     end
 
     test "uses existing materializer from available_services (legacy format)" do
@@ -303,9 +304,9 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhaseTest 
       :ets.delete(created)
     end
 
-    test "creates new materializer when not found but capable nodes exist" do
-      materializer_pid = spawn(fn -> Process.sleep(:infinity) end)
+    test "stalls existing-cluster recovery when tagged materializers have not advertised yet" do
       durable_version = Version.from_integer(100)
+      created = :ets.new(:created_on_missing, [:set, :public])
 
       recovery_attempt =
         recovery_attempt()
@@ -325,30 +326,24 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhaseTest 
           }
         ]
         |> create_test_context()
-        |> Map.put(:available_services, %{})
+        |> Map.put(:available_services, %{
+          "vofp3rks" => {:log, {:bedrock_fuu_worker_vofp3rks, node()}}
+        })
         |> Map.put(:create_worker_fn, fn _foreman_ref, _worker_id, :materializer, _opts ->
-          {:ok, :new_materializer_ref}
-        end)
-        |> Map.put(:lock_materializer_fn, fn _service, _epoch -> {:ok, materializer_pid} end)
-        |> Map.put(:unlock_materializer_fn, fn _pid, _version, _tsl -> :ok end)
-        |> Map.put(:materializer_info_fn, fn _pid, _facts ->
-          {:ok, %{durable_version: durable_version}}
-        end)
-        |> Map.put(:get_shard_layout_fn, fn _pid, _version ->
-          {:ok, %{<<0xFF>> => {0, <<>>}, Bedrock.end_of_keyspace() => {1, <<0xFF>>}}}
+          :ets.insert(created, {:created, true})
+          flunk("must not create a replacement materializer on existing-cluster recovery")
         end)
 
       log =
         capture_log(fn ->
-          assert {updated_attempt, CommitProxyStartupPhase} =
+          assert {_attempt, {:stalled, {:materializer_unavailable, :waiting_for_tagged_materializer}}} =
                    MaterializerBootstrapPhase.execute(recovery_attempt, context)
-
-          assert updated_attempt.metadata_materializer == materializer_pid
-          assert updated_attempt.shard_layout
         end)
 
-      assert log =~ "System shard materializer not found, creating new one"
-      assert log =~ "Materializer caught up to version"
+      assert log =~ "waiting for tagged shard"
+      refute log =~ "creating new one"
+      assert :ets.lookup(created, :created) == []
+      :ets.delete(created)
     end
 
     test "stalls on catchup timeout" do
@@ -448,16 +443,16 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhaseTest 
         |> create_test_context()
         |> Map.put(:available_services, %{})
         |> Map.put(:create_worker_fn, fn _foreman_ref, _worker_id, :materializer, _opts ->
-          {:error, :foreman_unavailable}
+          flunk("must not create a replacement materializer on existing-cluster recovery")
         end)
 
       log =
         capture_log(fn ->
-          {_attempt, {:stalled, result}} = MaterializerBootstrapPhase.execute(recovery_attempt, context)
-          assert {:failed_to_create_materializer, :foreman_unavailable, 0} = result
+          assert {_attempt, {:stalled, {:materializer_unavailable, :waiting_for_tagged_materializer}}} =
+                   MaterializerBootstrapPhase.execute(recovery_attempt, context)
         end)
 
-      assert log =~ "System shard materializer not found, creating new one"
+      assert log =~ "waiting for tagged shard"
     end
 
     test "filters logs to only system shard when unlocking" do
