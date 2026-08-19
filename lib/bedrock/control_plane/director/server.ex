@@ -88,6 +88,13 @@ defmodule Bedrock.ControlPlane.Director.Server do
   end
 
   @impl true
+  def handle_info(:retry_stalled_recovery, t) do
+    t
+    |> try_to_recover_if_stalled()
+    |> noreply()
+  end
+
+  @impl true
   def handle_info({:timeout, :ping_all_coordinators}, t) do
     t
     |> ping_all_coordinators()

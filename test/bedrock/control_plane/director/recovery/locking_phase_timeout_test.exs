@@ -7,16 +7,14 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LockingPhaseTimeoutTest do
   alias Bedrock.ControlPlane.Director.Recovery.LogRecoveryPlanningPhase
 
   describe "lock_old_system_services/3" do
-    test "ignores Task.async_stream lock timeouts instead of crashing" do
+    test "ignores lock timeouts instead of crashing" do
       services = %{
         "uqnjmhjl" => {:log, {:bedrock_fuu_worker_uqnjmhjl, node()}}
       }
 
       context = %{
-        lock_services_timeout_ms: 30,
         lock_service_fn: fn _service, _epoch ->
-          Process.sleep(200)
-          {:ok, self(), %{kind: :log}}
+          {:error, :timeout}
         end
       }
 
@@ -63,10 +61,8 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LockingPhaseTimeoutTest do
         |> Map.put(:available_services, %{
           "uqnjmhjl" => {:log, {:bedrock_fuu_worker_uqnjmhjl, node()}}
         })
-        |> Map.put(:lock_services_timeout_ms, 30)
         |> Map.put(:lock_service_fn, fn _service, _epoch ->
-          Process.sleep(200)
-          {:ok, self(), %{kind: :log}}
+          {:error, :timeout}
         end)
 
       assert {_attempt, {:stalled, :waiting_for_log_locks}} =

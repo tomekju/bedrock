@@ -63,7 +63,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LockingPhase do
   end
 
   @spec lock_old_system_services_timeout() :: Bedrock.timeout_in_ms()
-  def lock_old_system_services_timeout, do: 2_000
+  def lock_old_system_services_timeout, do: 10_000
 
   @spec lock_old_system_services(
           %{Worker.id() => %{kind: atom(), last_seen: {atom(), node()}}},
@@ -84,39 +84,33 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LockingPhase do
   def lock_old_system_services(old_system_services, epoch, context \\ %{}) do
     timeout_in_ms = Map.get(context, :lock_services_timeout_ms, lock_old_system_services_timeout())
 
+    # PATCHED (fuu): lock old logs sequentially in the director process.
+    # Task.async_stream inside a GenServer recovery callback can time out even
+    # when the same lock_for_recovery calls succeed from rpc in milliseconds.
     old_system_services
-    |> Task.async_stream(
-      fn {id, service} ->
-        {id, service, lock_service_for_recovery(service, epoch, context)}
-      end,
-      timeout: timeout_in_ms,
-      on_timeout: :kill_task,
-      ordered: false,
-      zip_input_on_exit: true
-    )
-    |> Enum.reduce_while({MapSet.new(), %{}, %{}, %{}}, fn
-      {:ok, {_, _, {:error, :newer_epoch_exists} = error}}, _ ->
-        {:halt, error}
+    |> Enum.reduce_while({MapSet.new(), %{}, %{}, %{}}, fn {id, service}, acc ->
+      case lock_one_old_system_service(service, epoch, context, timeout_in_ms) do
+        {:error, :newer_epoch_exists} = error ->
+          {:halt, error}
 
-      {:ok, {id, service, {:ok, pid, info}}}, {locked_ids, info_by_id, transaction_services, service_pids} ->
-        {:cont,
-         {MapSet.put(locked_ids, id), Map.put(info_by_id, id, info),
-          Map.put(transaction_services, id, %{
-            status: {:up, pid},
-            kind: info.kind,
-            last_seen:
-              case service do
-                {_kind, location} -> location
-                %{last_seen: location} -> location
-              end
-          }), Map.put(service_pids, id, pid)}}
+        {:ok, pid, info} ->
+          {locked_ids, info_by_id, transaction_services, service_pids} = acc
 
-      {:ok, {_id, _, {:error, _}}}, acc ->
-        {:cont, acc}
+          {:cont,
+           {MapSet.put(locked_ids, id), Map.put(info_by_id, id, info),
+            Map.put(transaction_services, id, %{
+              status: {:up, pid},
+              kind: info.kind,
+              last_seen:
+                case service do
+                  {_kind, location} -> location
+                  %{last_seen: location} -> location
+                end
+            }), Map.put(service_pids, id, pid)}}
 
-      # PATCHED (fuu): ignore lock timeouts from Task.async_stream instead of crashing.
-      {:exit, {_input, _reason}}, acc ->
-        {:cont, acc}
+        {:error, _reason} ->
+          {:cont, acc}
+      end
     end)
     |> case do
       {:error, _reason} = error ->
@@ -145,17 +139,35 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LockingPhase do
         ) ::
           {:ok, pid(), map()} | {:error, term()}
   def lock_service_for_recovery(service, epoch, context \\ %{}) do
-    lock_fn = Map.get(context, :lock_service_fn, &lock_service_impl/2)
+    lock_one_old_system_service(
+      service,
+      epoch,
+      context,
+      Map.get(context, :lock_services_timeout_ms, lock_old_system_services_timeout())
+    )
+  end
+
+  @spec lock_one_old_system_service(
+          {atom(), {atom(), node()}},
+          Bedrock.epoch(),
+          map(),
+          Bedrock.timeout_in_ms()
+        ) :: {:ok, pid(), map()} | {:error, term()}
+  defp lock_one_old_system_service(service, epoch, context, timeout_in_ms) do
+    default_lock = fn svc, ep -> lock_service_impl(svc, ep, timeout_in_ms) end
+    lock_fn = Map.get(context, :lock_service_fn, default_lock)
     lock_fn.(service, epoch)
   end
 
-  @spec lock_service_impl({atom(), {atom(), node()}}, Bedrock.epoch()) ::
+  @spec lock_service_impl({atom(), {atom(), node()}}, Bedrock.epoch(), Bedrock.timeout_in_ms()) ::
           {:ok, pid(), map()} | {:error, term()}
-  defp lock_service_impl({:log, name}, epoch), do: Log.lock_for_recovery(name, epoch)
+  defp lock_service_impl({:log, name}, epoch, timeout_in_ms),
+    do: Worker.lock_for_recovery(name, epoch, timeout_in_ms: timeout_in_ms)
 
-  defp lock_service_impl({:materializer, name}, epoch), do: Materializer.lock_for_recovery(name, epoch)
+  defp lock_service_impl({:materializer, name}, epoch, timeout_in_ms),
+    do: Worker.lock_for_recovery(name, epoch, timeout_in_ms: timeout_in_ms)
 
-  defp lock_service_impl(_, _), do: {:error, :unavailable}
+  defp lock_service_impl(_, _, _), do: {:error, :unavailable}
 
   @spec extract_old_system_services(map(), %{
           Worker.id() => {atom(), {atom(), node()}}

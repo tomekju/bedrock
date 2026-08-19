@@ -121,6 +121,9 @@ defmodule Bedrock.ControlPlane.Director.Recovery do
 
       {{:stalled, reason}, stalled} ->
         trace_recovery_stalled(Interval.between(stalled.started_at, now()), reason)
+        # PATCHED (fuu): retry stalled recovery after a short delay even if no
+        # new service_registered event arrives (logs may already be advertised).
+        Process.send_after(self(), :retry_stalled_recovery, 2_000)
 
         t
         |> Map.update!(:config, fn config ->
