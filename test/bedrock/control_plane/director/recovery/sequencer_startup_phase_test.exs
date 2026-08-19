@@ -102,5 +102,31 @@ defmodule Bedrock.ControlPlane.Director.Recovery.SequencerStartupPhaseTest do
       assert %{start: {GenServer, :start_link, [_, {_director, 5, 250}, _]}} =
                Agent.get(agent, & &1)
     end
+
+    test "starts sequencer at materializer current version when it is ahead of logs" do
+      agent = create_capture_agent()
+
+      start_supervised_fn = fn child_spec, _node ->
+        Agent.update(agent, fn _ -> child_spec end)
+        {:ok, spawn(fn -> :ok end)}
+      end
+
+      recovery_attempt = create_recovery_attempt(TestCluster, 5, {25, 250})
+
+      context = %{
+        start_supervised_fn: start_supervised_fn,
+        available_services: %{
+          "otqxhlks" => {{:materializer, 0}, {:test_materializer, node()}}
+        },
+        materializer_info_fn: fn _ref, _facts ->
+          {:ok, %{current_version: 5_000, durable_version: 5_000}}
+        end
+      }
+
+      {_result, _next_phase} = SequencerStartupPhase.execute(recovery_attempt, context)
+
+      assert %{start: {GenServer, :start_link, [_, {_director, 5, 5_000}, _]}} =
+               Agent.get(agent, & &1)
+    end
   end
 end

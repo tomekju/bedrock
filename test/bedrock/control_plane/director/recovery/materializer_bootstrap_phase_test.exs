@@ -512,6 +512,74 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhaseTest 
 
       :ets.delete(received_tsl)
     end
+
+    test "retries shard layout at materializer version when log version is too old" do
+      system_pid = spawn(fn -> Process.sleep(:infinity) end)
+      user_pid = spawn(fn -> Process.sleep(:infinity) end)
+      log_last = Version.from_integer(100)
+      mat_ver = Version.from_integer(5_000)
+      layout = %{<<0xFF>> => {1, <<>>}, Bedrock.end_of_keyspace() => {0, <<0xFF>>}}
+
+      recovery_attempt =
+        recovery_attempt()
+        |> Map.put(:metadata_materializer, nil)
+        |> Map.put(:shard_layout, nil)
+        |> Map.put(:logs, %{"log_1" => []})
+        |> Map.put(:version_vector, {Version.from_integer(0), log_last})
+        |> Map.put(:durable_version, Version.from_integer(0))
+
+      queried_versions = :ets.new(:queried_versions, [:bag, :public])
+
+      context =
+        [
+          old_transaction_system_layout: %{logs: %{"log_1" => []}}
+        ]
+        |> create_test_context()
+        |> Map.put(:available_services, %{
+          "otqxhlks" => {{:materializer, 0}, {:sys_mat, node()}},
+          "qksv2gvr" => {{:materializer, 1}, {:user_mat, node()}}
+        })
+        |> Map.put(:lock_materializer_fn, fn service, _epoch ->
+          case service do
+            {{:materializer, 1}, _} -> {:ok, user_pid}
+            _ -> {:ok, system_pid}
+          end
+        end)
+        |> Map.put(:unlock_materializer_fn, fn _pid, _version, _tsl -> :ok end)
+        |> Map.put(:materializer_info_fn, fn _pid, _facts ->
+          {:ok, %{current_version: mat_ver, durable_version: mat_ver}}
+        end)
+        |> Map.put(:materializer_read_ready_fn, fn _pid, _version -> :ok end)
+        |> Map.put(:materializer_force_durable_checkpoint_fn, fn _pid, _version -> :ok end)
+        |> Map.put(:get_shard_layout_fn, fn _pid, version ->
+          :ets.insert(queried_versions, {:version, version})
+
+          if version == log_last do
+            {:error, {:shard_layout_query_failed, :version_too_old}}
+          else
+            {:ok, layout}
+          end
+        end)
+
+      log =
+        capture_log(fn ->
+          assert {updated_attempt, CommitProxyStartupPhase} =
+                   MaterializerBootstrapPhase.execute(recovery_attempt, context)
+
+          assert updated_attempt.shard_layout == layout
+          assert updated_attempt.metadata_materializer == system_pid
+          assert updated_attempt.shard_materializers[0] == system_pid
+          assert updated_attempt.shard_materializers[1] == user_pid
+        end)
+
+      assert log =~ "retry shard layout at materializer version"
+
+      versions = queried_versions |> :ets.lookup(:version) |> Enum.map(&elem(&1, 1))
+      assert log_last in versions
+      assert mat_ver in versions
+
+      :ets.delete(queried_versions)
+    end
   end
 
   describe "default_shard_layout/0" do

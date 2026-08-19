@@ -341,10 +341,13 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
       |> extract_shard_tags()
       |> Enum.reject(&(&1 == system_shard))
 
-    if system_materializer_covers_all_shards?(recovery_attempt) do
+    if system_materializer_covers_all_shards?(recovery_attempt) and
+         not tagged_shard_materializers_present?(shard_tags, context) do
       # PATCHED (fuu): reuse the caught-up system materializer for all shards
       # when the recovered logs are untagged global logs. This avoids launching
       # duplicate cold materializer replays on local single-log clusters.
+      # PATCHED (fuu): do not reuse the system materializer when tagged shard
+      # materializers exist — they may be empty and still need log catchup.
       Logger.debug(
         "Reusing system materializer for shard tags #{inspect(shard_tags)} because recovered logs are untagged"
       )
@@ -373,6 +376,12 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
   end
 
   defp system_materializer_covers_all_shards?(_recovery_attempt), do: false
+
+  defp tagged_shard_materializers_present?(shard_tags, context) do
+    Enum.any?(shard_tags, fn shard_tag ->
+      match?({:ok, _service}, find_shard_materializer_service(context, shard_tag))
+    end)
+  end
 
   defp create_and_catch_up_materializers(shard_tags, target_version, recovery_attempt, context) do
     Enum.reduce_while(shard_tags, {:ok, %{}, recovery_attempt}, fn shard_tag, {:ok, acc, recovery_attempt} ->
@@ -910,8 +919,56 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
 
   defp get_shard_layout(materializer_pid, read_version, context) do
     get_layout_fn = Map.get(context, :get_shard_layout_fn, &default_get_shard_layout/2)
-    get_layout_fn.(materializer_pid, read_version)
+
+    case get_layout_fn.(materializer_pid, read_version) do
+      {:ok, _layout} = ok ->
+        ok
+
+      {:error, {:shard_layout_query_failed, :version_too_old}} ->
+        retry_shard_layout_at_materializer_version(materializer_pid, read_version, get_layout_fn, context)
+
+      {:error, :version_too_old} ->
+        retry_shard_layout_at_materializer_version(materializer_pid, read_version, get_layout_fn, context)
+
+      other ->
+        other
+    end
   end
+
+  # PATCHED (fuu): retry shard layout at materializer version when log version is too old.
+  # A later sequencer epoch can advance the system materializer past recovered logs, so
+  # get_range at the log last version returns :version_too_old even though the layout
+  # is readable at the materializer's current version.
+  defp retry_shard_layout_at_materializer_version(materializer_pid, read_version, get_layout_fn, context) do
+    info_fn = Map.get(context, :materializer_info_fn, &default_materializer_info/2)
+    readable_version = readable_materializer_version(info_fn.(materializer_pid, [:current_version, :durable_version]))
+
+    if is_binary(readable_version) and readable_version != read_version do
+      Logger.info(
+        "PATCHED (fuu): retry shard layout at materializer version when log version is too old; log=#{inspect(read_version)} materializer=#{inspect(readable_version)}"
+      )
+
+      case get_layout_fn.(materializer_pid, readable_version) do
+        {:ok, _layout} = ok ->
+          ok
+
+        {:error, _reason} ->
+          Logger.warning(
+            "Shard layout unreadable at materializer version #{inspect(readable_version)}; using default two-shard layout"
+          )
+
+          {:ok, default_shard_layout()}
+      end
+    else
+      Logger.warning("Shard layout unreadable at log version #{inspect(read_version)}; using default two-shard layout")
+
+      {:ok, default_shard_layout()}
+    end
+  end
+
+  defp readable_materializer_version({:ok, %{current_version: version}}) when is_binary(version), do: version
+  defp readable_materializer_version({:ok, %{durable_version: version}}) when is_binary(version), do: version
+  defp readable_materializer_version(_info), do: nil
 
   defp default_get_shard_layout(materializer_pid, read_version) do
     # Query the materializer for shard layout via get_range on shard_keys prefix
