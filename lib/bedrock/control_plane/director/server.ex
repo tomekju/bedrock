@@ -80,17 +80,25 @@ defmodule Bedrock.ControlPlane.Director.Server do
 
   @impl true
   def handle_continue(:start_recovery, %State{} = t) do
-    # Services are already provided by coordinator from service directory
-    t
-    |> ping_all_coordinators()
-    |> try_to_recover()
-    |> noreply()
+    # PATCHED (fuu): return to the GenServer loop before recovery so pending
+    # log/coordinator calls can be answered. Nested receive/call from this
+    # callback deadlocks lock_for_recovery even when the same lock succeeds
+    # from rpc.
+    t = ping_all_coordinators(t)
+    send(self(), :run_recovery)
+    noreply(t)
   end
 
   @impl true
   def handle_info(:retry_stalled_recovery, t) do
+    send(self(), :run_recovery)
+    noreply(t)
+  end
+
+  @impl true
+  def handle_info(:run_recovery, t) do
     t
-    |> try_to_recover_if_stalled()
+    |> try_to_recover()
     |> noreply()
   end
 
@@ -140,9 +148,8 @@ defmodule Bedrock.ControlPlane.Director.Server do
   def handle_call({:request_to_rejoin, node, capabilities, running_services}, _from, t) do
     {:ok, updated_t} = request_to_rejoin(t, node, capabilities, Map.values(running_services), now())
 
-    updated_t
-    |> try_to_recover()
-    |> reply(:ok)
+    send(self(), :run_recovery)
+    reply(updated_t, :ok)
   end
 
   @impl true
@@ -160,24 +167,20 @@ defmodule Bedrock.ControlPlane.Director.Server do
   def handle_cast({:pong, _from}, t), do: noreply(t)
 
   def handle_cast({:node_added_worker, node, worker_info}, %State{} = t) do
-    t
-    |> node_added_worker(node, worker_info, now())
-    |> try_to_recover()
-    |> noreply()
+    t = node_added_worker(t, node, worker_info, now())
+    send(self(), :run_recovery)
+    noreply(t)
   end
 
   def handle_cast({:service_registered, service_infos}, %State{} = t) do
-    t
-    |> add_services_to_directory(service_infos)
-    |> try_to_recover_if_stalled()
-    |> noreply()
+    t = add_services_to_directory(t, service_infos)
+    send(self(), :run_recovery)
+    noreply(t)
   end
 
   def handle_cast({:capabilities_updated, node_capabilities}, %State{} = t) do
-    t
-    |> Map.put(:node_capabilities, node_capabilities)
-    |> try_to_recover_if_stalled()
-    |> noreply()
+    send(self(), :run_recovery)
+    noreply(%{t | node_capabilities: node_capabilities})
   end
 
   # Catch-all for unexpected cast messages (e.g., from old incarnations)
