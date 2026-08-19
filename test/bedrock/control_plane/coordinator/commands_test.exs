@@ -42,6 +42,27 @@ defmodule Bedrock.ControlPlane.Coordinator.CommandsTest do
     test "handles empty service list" do
       assert {:register_services, %{services: []}} = Commands.register_services([])
     end
+
+    test "accepts tagged materializer kinds" do
+      services = [{"fmzq3nkp", {:materializer, 1}, {:bedrock_fuu_worker_fmzq3nkp, :node@host}}]
+
+      assert {:register_services, %{services: ^services}} = Commands.register_services(services)
+    end
+  end
+
+  describe "merge_node_resources/3" do
+    test "accepts tagged materializer kinds used by Foreman advertisement" do
+      services = [{"t22odrmd", {:materializer, 0}, {:bedrock_fuu_worker_t22odrmd, :node@host}}]
+
+      assert {:merge_node_resources, %{node: :node@host, services: ^services, capabilities: []}} =
+               Commands.merge_node_resources(:node@host, services, [])
+    end
+
+    test "still rejects malformed service info" do
+      assert_raise ArgumentError, ~r/Invalid service info/, fn ->
+        Commands.merge_node_resources(:node@host, [{"svc", {:materializer, -1}, {:w, :n@h}}], [])
+      end
+    end
   end
 
   describe "deregister_services/1" do

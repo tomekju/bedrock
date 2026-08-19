@@ -93,21 +93,7 @@ defmodule Bedrock.ControlPlane.Coordinator.Commands do
   """
   @spec register_services([service_info()]) :: register_services_command()
   def register_services(services) when is_list(services) do
-    # Validate service info format
-    Enum.each(services, fn
-      {service_id, kind, {name, service_node}}
-      when is_binary(service_id) and is_atom(kind) and is_atom(name) and is_atom(service_node) ->
-        :ok
-
-      {service_id, {:materializer, shard_id}, {name, service_node}}
-      when is_binary(service_id) and is_integer(shard_id) and shard_id >= 0 and is_atom(name) and
-             is_atom(service_node) ->
-        :ok
-
-      invalid ->
-        raise ArgumentError,
-              "Invalid service info: #{inspect(invalid)}. Expected {service_id, kind | {:materializer, shard_id}, {name, node}}"
-    end)
+    Enum.each(services, &validate_service_info!/1)
 
     {
       :register_services,
@@ -135,23 +121,30 @@ defmodule Bedrock.ControlPlane.Coordinator.Commands do
   # Private validation helper
   @spec validate_node_resources!([service_info()], [Bedrock.Cluster.capability()]) :: :ok
   defp validate_node_resources!(services, capabilities) do
-    # Validate service info format
-    Enum.each(services, fn
-      {service_id, kind, {name, service_node}}
-      when is_binary(service_id) and is_atom(kind) and is_atom(name) and is_atom(service_node) ->
-        :ok
+    # PATCHED (fuu): accept tagged materializer kinds in node resource validation
+    Enum.each(services, &validate_service_info!/1)
 
-      invalid ->
-        raise ArgumentError,
-              "Invalid service info: #{inspect(invalid)}. Expected {service_id, kind, {name, node}}"
-    end)
-
-    # Validate capabilities
     Enum.each(capabilities, fn
       capability when is_atom(capability) -> :ok
       invalid -> raise ArgumentError, "Invalid capability: #{inspect(invalid)}. Expected atom"
     end)
 
     :ok
+  end
+
+  @spec validate_service_info!(term()) :: :ok
+  defp validate_service_info!({service_id, kind, {name, service_node}})
+       when is_binary(service_id) and is_atom(kind) and is_atom(name) and is_atom(service_node) do
+    :ok
+  end
+
+  defp validate_service_info!({service_id, {:materializer, shard_id}, {name, service_node}})
+       when is_binary(service_id) and is_integer(shard_id) and shard_id >= 0 and is_atom(name) and is_atom(service_node) do
+    :ok
+  end
+
+  defp validate_service_info!(invalid) do
+    raise ArgumentError,
+          "Invalid service info: #{inspect(invalid)}. Expected {service_id, kind | {:materializer, shard_id}, {name, node}}"
   end
 end
