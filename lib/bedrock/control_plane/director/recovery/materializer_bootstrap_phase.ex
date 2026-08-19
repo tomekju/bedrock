@@ -402,12 +402,19 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
         end
 
       {:error, {:materializer_unavailable, :not_in_available_services}} ->
-        # PATCHED (fuu): wait for tagged shard materializer advertisement instead of creating a replacement
-        Logger.info(
-          "Shard #{inspect(shard_tag)} materializer not found among #{inspect(Map.keys(Map.get(context, :available_services, %{})))}; waiting for tagged advertisement"
-        )
+        if Map.get(context, :allow_create_materializer?, false) do
+          with {:ok, {service_id, worker_ref, node, pid}} <-
+                 create_and_start_materializer(shard_tag, recovery_attempt, context) do
+            {:ok, {:created, service_id, worker_ref, node, pid}}
+          end
+        else
+          # PATCHED (fuu): wait for tagged shard materializer advertisement instead of creating a replacement
+          Logger.info(
+            "Shard #{inspect(shard_tag)} materializer not found among #{inspect(Map.keys(Map.get(context, :available_services, %{})))}; waiting for tagged advertisement"
+          )
 
-        {:error, {:materializer_unavailable, :waiting_for_tagged_materializer}}
+          {:error, {:materializer_unavailable, :waiting_for_tagged_materializer}}
+        end
     end
   end
 
@@ -452,15 +459,13 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
   defp materializer_last_seen(_service), do: nil
 
   # Find existing materializer or create a new one for the system shard
-  defp find_or_create_materializer(_recovery_attempt, context) do
+  defp find_or_create_materializer(recovery_attempt, context) do
     case find_materializer_service(context) do
       {:ok, {_service_id, _service} = located_service} ->
         {:ok, located_service}
 
       {:error, {:materializer_unavailable, :not_in_available_services}} ->
-        # PATCHED (fuu): never create a replacement system materializer during
-        # existing-cluster recovery. Creating one consumes the snapshotless token.
-        stall_for_tagged_materializer(context, RecoveryAttempt.system_shard_id())
+        maybe_create_or_stall_system_materializer(recovery_attempt, context)
 
       {:error, {:materializer_unavailable, :ambiguous_legacy_materializers}} ->
         case most_advanced_legacy_materializer_service(context) do
@@ -474,12 +479,20 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
             {:ok, located_service}
 
           {:error, :no_reusable_legacy_materializer} ->
-            Logger.warning(
-              "Multiple legacy untagged materializers found; waiting for tagged system shard advertisement"
-            )
-
-            stall_for_tagged_materializer(context, RecoveryAttempt.system_shard_id())
+            maybe_create_or_stall_system_materializer(recovery_attempt, context)
         end
+    end
+  end
+
+  defp maybe_create_or_stall_system_materializer(recovery_attempt, context) do
+    if Map.get(context, :allow_create_materializer?, false) do
+      # PATCHED (fuu): create a new shard-tagged system materializer
+      Logger.info("System shard materializer not found, creating new one")
+      create_materializer(recovery_attempt, context)
+    else
+      # PATCHED (fuu): never create a replacement system materializer during
+      # existing-cluster recovery. Creating one consumes the snapshotless token.
+      stall_for_tagged_materializer(context, RecoveryAttempt.system_shard_id())
     end
   end
 
