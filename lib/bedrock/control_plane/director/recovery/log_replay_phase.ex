@@ -97,31 +97,24 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhase do
     survivor_pids = Enum.map(survivor_log_ids, &Map.get(service_pids, &1))
     survivor_pids = Enum.reject(survivor_pids, &is_nil/1)
 
+    # PATCHED (fuu): copy logs sequentially in the director process.
+    # Task.async_stream from a GenServer recovery callback drops Task alias
+    # replies on Elixir 1.20 and stalls recovery after log locks succeed.
     new_log_ids
-    |> Task.async_stream(
-      fn new_log_id ->
-        new_log_id
-        |> copy_log_data_fn.(survivor_pids, first_version, last_version, service_pids)
-        |> then(&{new_log_id, &1})
-      end,
-      ordered: false,
-      zip_input_on_exit: true,
-      timeout: 30_000
-    )
-    |> Enum.reduce_while(%{}, fn
-      {:ok, {_, {:error, :newer_epoch_exists} = error}}, _ ->
-        {:halt, error}
+    |> Enum.reduce_while(%{}, fn new_log_id, failures ->
+      case copy_log_data_fn.(new_log_id, survivor_pids, first_version, last_version, service_pids) do
+        {:error, :newer_epoch_exists} = error ->
+          {:halt, error}
 
-      {:ok, {_log_id, {:ok, _pid}}}, failures ->
-        {:cont, failures}
+        {:ok, _pid} ->
+          {:cont, failures}
 
-      {:ok, {log_id, {:error, reason}}}, failures ->
-        {:cont, Map.put(failures, log_id, reason)}
-
-      {:exit, {log_id, reason}}, failures ->
-        {:cont, Map.put(failures, log_id, reason)}
+        {:error, reason} ->
+          {:cont, Map.put(failures, new_log_id, reason)}
+      end
     end)
     |> case do
+      {:error, _reason} = error -> error
       failures when failures == %{} -> :ok
       failures -> {:error, {:failed_to_copy_some_logs, failures}}
     end

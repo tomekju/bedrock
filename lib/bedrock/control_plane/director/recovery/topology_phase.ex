@@ -228,15 +228,12 @@ defmodule Bedrock.ControlPlane.Director.Recovery.TopologyPhase do
     resolver_layout = CommitProxy.ResolverLayout.from_layout(transaction_system_layout)
     routing_data = build_routing_data(transaction_system_layout)
 
-    proxies
-    |> Task.async_stream(
-      &unlock_fn.(&1, lock_token, sequencer, resolver_layout, routing_data),
-      ordered: false
-    )
-    |> Enum.reduce_while(:ok, fn
-      {:ok, :ok}, :ok -> {:cont, :ok}
-      {:ok, {:error, reason}}, _ -> {:halt, {:error, {:commit_proxy_unlock_failed, reason}}}
-      {:exit, reason}, _ -> {:halt, {:error, {:commit_proxy_unlock_crashed, reason}}}
+    # PATCHED (fuu): unlock commit proxies sequentially in the director process.
+    Enum.reduce_while(proxies, :ok, fn proxy, :ok ->
+      case unlock_fn.(proxy, lock_token, sequencer, resolver_layout, routing_data) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {:commit_proxy_unlock_failed, reason}}}
+      end
     end)
   end
 

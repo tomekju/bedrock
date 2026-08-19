@@ -117,27 +117,15 @@ defmodule Bedrock.ControlPlane.Director.Recovery.ResolverStartupPhase do
           {:ok, [{start_key :: Bedrock.key(), resolver :: pid()}]}
           | {:error, {:failed_to_start, :resolver, node(), reason :: term()}}
   def start_resolvers(resolver_boot_info, available_nodes, start_supervised) do
+    # PATCHED (fuu): start resolvers sequentially in the director process.
     available_nodes
     |> Stream.cycle()
     |> Enum.zip(resolver_boot_info)
-    |> Task.async_stream(
-      fn {node, {child_spec, start_key}} ->
-        case start_supervised.(child_spec, node) do
-          {:ok, resolver} -> {node, {start_key, resolver}}
-          {:error, reason} -> {node, {:error, reason}}
-        end
-      end,
-      ordered: false
-    )
-    |> Enum.reduce_while([], fn
-      {:ok, {_node, {start_key, pid}}}, resolvers when is_pid(pid) ->
-        {:cont, [{start_key, pid} | resolvers]}
-
-      {:ok, {node, {:error, reason}}}, _ ->
-        {:halt, {:error, {:failed_to_start, :resolver, node, reason}}}
-
-      {:exit, {node, reason}}, _ ->
-        {:halt, {:error, {:failed_to_start, :resolver, node, reason}}}
+    |> Enum.reduce_while([], fn {node, {child_spec, start_key}}, resolvers ->
+      case start_supervised.(child_spec, node) do
+        {:ok, resolver} -> {:cont, [{start_key, resolver} | resolvers]}
+        {:error, reason} -> {:halt, {:error, {:failed_to_start, :resolver, node, reason}}}
+      end
     end)
     |> case do
       {:error, reason} -> {:error, reason}

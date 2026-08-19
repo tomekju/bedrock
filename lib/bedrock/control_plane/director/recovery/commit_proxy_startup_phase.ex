@@ -136,24 +136,15 @@ defmodule Bedrock.ControlPlane.Director.Recovery.CommitProxyStartupPhase do
         ) ::
           {:ok, [pid()]} | {:error, {:failed_to_start, :commit_proxy, node(), term()}}
   defp start_proxies(nodes_with_instances, cluster, epoch, director, lock_token, cluster_config, start_supervised) do
+    # PATCHED (fuu): start commit proxies sequentially in the director process.
     nodes_with_instances
-    |> Task.async_stream(
-      fn {node, instance} ->
-        child_spec = child_spec(cluster, epoch, director, lock_token, cluster_config, instance)
+    |> Enum.reduce_while({:ok, []}, fn {node, instance}, {:ok, acc} ->
+      child_spec = child_spec(cluster, epoch, director, lock_token, cluster_config, instance)
 
-        child_spec
-        |> start_supervised.(node)
-        |> case do
-          {:ok, pid} -> {:ok, pid}
-          {:error, reason} -> {:error, {:failed_to_start, :commit_proxy, node, reason}}
-        end
-      end,
-      ordered: true
-    )
-    |> Enum.reduce_while({:ok, []}, fn
-      {:ok, {:ok, pid}}, {:ok, acc} -> {:cont, {:ok, [pid | acc]}}
-      {:ok, {:error, reason}}, _ -> {:halt, {:error, reason}}
-      {:exit, reason}, _ -> {:halt, {:error, {:failed_to_start, :commit_proxy, :unknown_node, reason}}}
+      case start_supervised.(child_spec, node) do
+        {:ok, pid} -> {:cont, {:ok, [pid | acc]}}
+        {:error, reason} -> {:halt, {:error, {:failed_to_start, :commit_proxy, node, reason}}}
+      end
     end)
     |> case do
       {:ok, pids} -> {:ok, Enum.reverse(pids)}
