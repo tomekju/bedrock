@@ -156,7 +156,38 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LockingPhase do
   defp lock_one_old_system_service(service, epoch, context, timeout_in_ms) do
     default_lock = fn svc, ep -> lock_service_impl(svc, ep, timeout_in_ms) end
     lock_fn = Map.get(context, :lock_service_fn, default_lock)
-    lock_fn.(service, epoch)
+
+    # PATCHED (fuu): never GenServer.call a log from the director process.
+    # lock_for_recovery succeeds from rpc in milliseconds, but the same call
+    # from inside a Director callback blocks and leaves locked_service_ids empty.
+    if Map.has_key?(context, :lock_service_fn) do
+      lock_fn.(service, epoch)
+    else
+      lock_in_isolated_process(lock_fn, service, epoch, timeout_in_ms)
+    end
+  end
+
+  defp lock_in_isolated_process(lock_fn, service, epoch, timeout_in_ms) do
+    parent = self()
+    request_ref = make_ref()
+
+    {pid, monitor_ref} =
+      spawn_monitor(fn ->
+        send(parent, {:lock_result, request_ref, lock_fn.(service, epoch)})
+      end)
+
+    receive do
+      {:lock_result, ^request_ref, result} ->
+        Process.demonitor(monitor_ref, [:flush])
+        result
+
+      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        {:error, reason}
+    after
+      timeout_in_ms ->
+        Process.exit(pid, :kill)
+        {:error, :timeout}
+    end
   end
 
   @spec lock_service_impl({atom(), {atom(), node()}}, Bedrock.epoch(), Bedrock.timeout_in_ms()) ::

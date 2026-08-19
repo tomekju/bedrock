@@ -114,6 +114,14 @@ defmodule Bedrock.ControlPlane.Director.Server do
     noreply(t)
   end
 
+  def handle_info({:lock_result, _request_ref, _result}, t) do
+    noreply(t)
+  end
+
+  def handle_info({:copy_log_result, _request_ref, _result}, t) do
+    noreply(t)
+  end
+
   @impl true
 
   def handle_call(:fetch_transaction_system_layout, _from, t) do

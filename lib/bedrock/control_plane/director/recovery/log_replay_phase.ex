@@ -102,7 +102,18 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhase do
     # replies on Elixir 1.20 and stalls recovery after log locks succeed.
     new_log_ids
     |> Enum.reduce_while(%{}, fn new_log_id, failures ->
-      case copy_log_data_fn.(new_log_id, survivor_pids, first_version, last_version, service_pids) do
+      result =
+        copy_one_log(
+          copy_log_data_fn,
+          new_log_id,
+          survivor_pids,
+          first_version,
+          last_version,
+          service_pids,
+          Map.has_key?(context, :copy_log_data_fn)
+        )
+
+      case result do
         {:error, :newer_epoch_exists} = error ->
           {:halt, error}
 
@@ -157,6 +168,37 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhase do
       first_version,
       last_version
     )
+  end
+
+  defp copy_one_log(copy_log_data_fn, new_log_id, survivor_pids, first_version, last_version, service_pids, true) do
+    copy_log_data_fn.(new_log_id, survivor_pids, first_version, last_version, service_pids)
+  end
+
+  defp copy_one_log(copy_log_data_fn, new_log_id, survivor_pids, first_version, last_version, service_pids, false) do
+    parent = self()
+    request_ref = make_ref()
+
+    {pid, monitor_ref} =
+      spawn_monitor(fn ->
+        send(
+          parent,
+          {:copy_log_result, request_ref,
+           copy_log_data_fn.(new_log_id, survivor_pids, first_version, last_version, service_pids)}
+        )
+      end)
+
+    receive do
+      {:copy_log_result, ^request_ref, result} ->
+        Process.demonitor(monitor_ref, [:flush])
+        result
+
+      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        {:error, reason}
+    after
+      30_000 ->
+        Process.exit(pid, :kill)
+        {:error, :timeout}
+    end
   end
 
   # Legacy pairing function kept for backward compatibility with tests
