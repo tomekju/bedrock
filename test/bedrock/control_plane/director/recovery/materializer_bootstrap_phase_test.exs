@@ -131,7 +131,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhaseTest 
         })
         |> Map.put(:lock_materializer_fn, fn _service, _epoch -> {:ok, materializer_pid} end)
         |> Map.put(:unlock_materializer_fn, fn _pid, _version, _tsl -> :ok end)
-        |> Map.put(:materializer_info_fn, fn _pid, [:durable_version] ->
+        |> Map.put(:materializer_info_fn, fn _pid, _facts ->
           {:ok, %{durable_version: durable_version}}
         end)
         |> Map.put(:get_shard_layout_fn, fn _pid, _version ->
@@ -174,7 +174,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhaseTest 
         })
         |> Map.put(:lock_materializer_fn, fn _service, _epoch -> {:ok, materializer_pid} end)
         |> Map.put(:unlock_materializer_fn, fn _pid, _version, _tsl -> :ok end)
-        |> Map.put(:materializer_info_fn, fn _pid, [:durable_version] ->
+        |> Map.put(:materializer_info_fn, fn _pid, _facts ->
           {:ok, %{durable_version: durable_version}}
         end)
         |> Map.put(:get_shard_layout_fn, fn _pid, _version ->
@@ -191,6 +191,116 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhaseTest 
         end)
 
       assert log =~ "Materializer caught up to version"
+    end
+
+    test "reuses merge_node_resources tagged kinds when progress cannot be probed" do
+      materializer_pid = spawn(fn -> Process.sleep(:infinity) end)
+      durable_version = Version.from_integer(100)
+      created = :ets.new(:created_materializers, [:set, :public])
+      system_ref = {:bedrock_fuu_worker_t22odrmd, node()}
+      user_ref = {:bedrock_fuu_worker_fmzq3nkp, node()}
+
+      recovery_attempt =
+        recovery_attempt()
+        |> Map.put(:metadata_materializer, nil)
+        |> Map.put(:shard_layout, nil)
+        |> Map.put(:logs, %{"log_1" => [0, 1]})
+        |> Map.put(:durable_version, durable_version)
+
+      context =
+        [
+          old_transaction_system_layout: %{
+            logs: %{"log_1" => [0, 1]}
+          },
+          node_capabilities: %{
+            log: [Node.self()],
+            materializer: [Node.self()]
+          }
+        ]
+        |> create_test_context()
+        |> Map.put(:available_services, %{
+          "t22odrmd" => {{:materializer, 0}, system_ref},
+          "fmzq3nkp" => {{:materializer, 1}, user_ref}
+        })
+        |> Map.put(:create_worker_fn, fn _foreman, _id, :materializer, _opts ->
+          :ets.insert(created, {:created, true})
+          flunk("must not create a replacement materializer when tagged services exist")
+        end)
+        |> Map.put(:lock_materializer_fn, fn _service, _epoch -> {:ok, materializer_pid} end)
+        |> Map.put(:unlock_materializer_fn, fn _pid, _version, _tsl -> :ok end)
+        |> Map.put(:materializer_info_fn, fn _pid, _facts -> {:error, :noproc} end)
+        |> Map.put(:materializer_read_ready_fn, fn _pid, _version -> :ok end)
+        |> Map.put(:materializer_force_durable_checkpoint_fn, fn _pid, _version -> :ok end)
+        |> Map.put(:get_shard_layout_fn, fn _pid, _version ->
+          {:ok, %{<<0xFF>> => {0, <<>>}, Bedrock.end_of_keyspace() => {1, <<0xFF>>}}}
+        end)
+
+      log =
+        capture_log(fn ->
+          assert {updated_attempt, CommitProxyStartupPhase} =
+                   MaterializerBootstrapPhase.execute(recovery_attempt, context)
+
+          assert updated_attempt.metadata_materializer == materializer_pid
+          assert updated_attempt.shard_layout
+        end)
+
+      refute log =~ "System shard materializer not found, creating new one"
+      assert log =~ "Reusing most advanced shard"
+      assert :ets.lookup(created, :created) == []
+      :ets.delete(created)
+    end
+
+    test "reuses 3-tuple shard materializers when progress cannot be probed" do
+      materializer_pid = spawn(fn -> Process.sleep(:infinity) end)
+      durable_version = Version.from_integer(100)
+      created = :ets.new(:created_materializers_3tuple, [:set, :public])
+
+      recovery_attempt =
+        recovery_attempt()
+        |> Map.put(:metadata_materializer, nil)
+        |> Map.put(:shard_layout, nil)
+        |> Map.put(:logs, %{"log_1" => [0, 1]})
+        |> Map.put(:durable_version, durable_version)
+
+      context =
+        [
+          old_transaction_system_layout: %{
+            logs: %{"log_1" => [0, 1]}
+          },
+          node_capabilities: %{
+            log: [Node.self()],
+            materializer: [Node.self()]
+          }
+        ]
+        |> create_test_context()
+        |> Map.put(:available_services, %{
+          "mat_sys_0" => {:materializer, {:test_materializer, node()}, 0},
+          "mat_user_1" => {:materializer, {:test_user_materializer, node()}, 1}
+        })
+        |> Map.put(:create_worker_fn, fn _foreman, _id, :materializer, _opts ->
+          :ets.insert(created, {:created, true})
+          flunk("must not create a replacement materializer when tagged 3-tuple services exist")
+        end)
+        |> Map.put(:lock_materializer_fn, fn _service, _epoch -> {:ok, materializer_pid} end)
+        |> Map.put(:unlock_materializer_fn, fn _pid, _version, _tsl -> :ok end)
+        |> Map.put(:materializer_info_fn, fn _pid, _facts -> {:error, :noproc} end)
+        |> Map.put(:materializer_read_ready_fn, fn _pid, _version -> :ok end)
+        |> Map.put(:materializer_force_durable_checkpoint_fn, fn _pid, _version -> :ok end)
+        |> Map.put(:get_shard_layout_fn, fn _pid, _version ->
+          {:ok, %{<<0xFF>> => {0, <<>>}, Bedrock.end_of_keyspace() => {1, <<0xFF>>}}}
+        end)
+
+      log =
+        capture_log(fn ->
+          assert {updated_attempt, CommitProxyStartupPhase} =
+                   MaterializerBootstrapPhase.execute(recovery_attempt, context)
+
+          assert updated_attempt.metadata_materializer == materializer_pid
+        end)
+
+      refute log =~ "System shard materializer not found, creating new one"
+      assert :ets.lookup(created, :created) == []
+      :ets.delete(created)
     end
 
     test "creates new materializer when not found but capable nodes exist" do
@@ -221,7 +331,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhaseTest 
         end)
         |> Map.put(:lock_materializer_fn, fn _service, _epoch -> {:ok, materializer_pid} end)
         |> Map.put(:unlock_materializer_fn, fn _pid, _version, _tsl -> :ok end)
-        |> Map.put(:materializer_info_fn, fn _pid, [:durable_version] ->
+        |> Map.put(:materializer_info_fn, fn _pid, _facts ->
           {:ok, %{durable_version: durable_version}}
         end)
         |> Map.put(:get_shard_layout_fn, fn _pid, _version ->
@@ -385,7 +495,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhaseTest 
           :ets.insert(received_tsl, {:tsl, tsl})
           :ok
         end)
-        |> Map.put(:materializer_info_fn, fn _pid, [:durable_version] ->
+        |> Map.put(:materializer_info_fn, fn _pid, _facts ->
           {:ok, %{durable_version: durable_version}}
         end)
         |> Map.put(:get_shard_layout_fn, fn _pid, _version ->

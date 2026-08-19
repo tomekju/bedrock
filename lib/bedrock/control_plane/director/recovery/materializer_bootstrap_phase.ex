@@ -445,6 +445,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
 
   defp materializer_last_seen({:materializer, last_seen}), do: last_seen
   defp materializer_last_seen({:materializer, last_seen, _shard_id}), do: last_seen
+  defp materializer_last_seen({{:materializer, _shard_id}, last_seen}), do: last_seen
   defp materializer_last_seen(%{last_seen: last_seen}), do: last_seen
   defp materializer_last_seen(_service), do: nil
 
@@ -499,28 +500,47 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
 
   defp find_shard_materializer_service(%{available_services: services} = context, shard_tag) do
     # PATCHED (fuu): reuse existing shard materializers during recovery.
-    services
-    |> Enum.filter(&shard_materializer_service?(&1, shard_tag, context))
-    |> Enum.reduce([], fn {_id, service} = candidate, acc ->
-      case legacy_materializer_progress(service, context) do
-        nil -> acc
-        progress -> [{progress, candidate} | acc]
-      end
-    end)
-    |> case do
+    # PATCHED (fuu): reuse tagged materializer kinds even when progress cannot be probed.
+    matches = Enum.filter(services, &shard_materializer_service?(&1, shard_tag, context))
+
+    case matches do
       [] ->
         {:error, {:materializer_unavailable, :not_in_available_services}}
 
       candidates ->
-        {progress, candidate} = Enum.max_by(candidates, fn {progress, _candidate} -> progress end)
+        {progress, candidate} = pick_reusable_materializer(candidates, context)
         Logger.debug("Reusing most advanced shard #{inspect(shard_tag)} materializer at #{inspect(progress)}")
         {:ok, candidate}
+    end
+  end
+
+  defp pick_reusable_materializer(candidates, context) do
+    ranked =
+      Enum.map(candidates, fn {_id, service} = candidate ->
+        {legacy_materializer_progress(service, context), candidate}
+      end)
+
+    case Enum.reject(ranked, fn {progress, _candidate} -> is_nil(progress) end) do
+      [] ->
+        # Directory identity is enough: do not create a replacement materializer
+        # that would consume the snapshotless first-boot token.
+        {nil, hd(candidates)}
+
+      with_progress ->
+        Enum.max_by(with_progress, fn {progress, _candidate} -> progress end)
     end
   end
 
   defp shard_materializer_service?({_id, {kind, _ref, service_shard_tag}}, shard_tag, _context)
        when is_integer(service_shard_tag) do
     kind == :materializer and service_shard_tag == shard_tag
+  end
+
+  defp shard_materializer_service?({_id, {{:materializer, service_shard_tag}, _ref}}, shard_tag, _context)
+       when is_integer(service_shard_tag) do
+    # PATCHED (fuu): treat {:materializer, shard_id} as a tagged kind, not a worker ref.
+    # merge/set_node_resources stores { {{:materializer, shard}, worker_ref} }.
+    service_shard_tag == shard_tag
   end
 
   defp shard_materializer_service?({_id, {:materializer, _ref} = service}, shard_tag, context) do
@@ -533,10 +553,16 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
   defp runtime_materializer_shard_tag(service, context) do
     info_fn = Map.get(context, :materializer_info_fn, &default_materializer_info/2)
 
-    case info_fn.(materializer_ref(service), [:shard_id]) do
-      {:ok, %{shard_id: shard_id}} -> normalize_materializer_shard_tag(shard_id)
-      {:ok, %{"shard_id" => shard_id}} -> normalize_materializer_shard_tag(shard_id)
-      _ -> nil
+    case materializer_ref(service) do
+      nil ->
+        nil
+
+      ref ->
+        case info_fn.(ref, [:shard_id]) do
+          {:ok, %{shard_id: shard_id}} -> normalize_materializer_shard_tag(shard_id)
+          {:ok, %{"shard_id" => shard_id}} -> normalize_materializer_shard_tag(shard_id)
+          _ -> nil
+        end
     end
   end
 
@@ -566,7 +592,8 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
     end
   end
 
-  defp legacy_untagged_materializer_service?({_id, {:materializer, _last_seen}}), do: true
+  defp legacy_untagged_materializer_service?({_id, {:materializer, last_seen}}) when not is_integer(last_seen), do: true
+
   defp legacy_untagged_materializer_service?(_service), do: false
 
   defp most_advanced_legacy_materializer_service(%{available_services: services} = context) do
@@ -591,23 +618,31 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
   defp legacy_materializer_progress(service, context) do
     info_fn = Map.get(context, :materializer_info_fn, &default_materializer_info/2)
 
-    case info_fn.(materializer_ref(service), [:current_version, :durable_version]) do
-      {:ok, %{current_version: current_version, durable_version: durable_version}}
-      when is_binary(current_version) and is_binary(durable_version) ->
-        {current_version, durable_version}
-
-      {:ok, %{durable_version: durable_version}} when is_binary(durable_version) ->
-        {durable_version, durable_version}
-
-      _ ->
+    case materializer_ref(service) do
+      nil ->
         nil
+
+      ref ->
+        case info_fn.(ref, [:current_version, :durable_version]) do
+          {:ok, %{current_version: current_version, durable_version: durable_version}}
+          when is_binary(current_version) and is_binary(durable_version) ->
+            {current_version, durable_version}
+
+          {:ok, %{durable_version: durable_version}} when is_binary(durable_version) ->
+            {durable_version, durable_version}
+
+          _ ->
+            nil
+        end
     end
   end
 
   defp materializer_ref({:materializer, last_seen}), do: last_seen
   defp materializer_ref({:materializer, last_seen, _shard_id}), do: last_seen
+  defp materializer_ref({{:materializer, _shard_id}, last_seen}), do: last_seen
   defp materializer_ref(%{status: {:up, pid}}), do: pid
   defp materializer_ref(%{last_seen: last_seen}), do: last_seen
+  defp materializer_ref(_service), do: nil
 
   # Create a new materializer on a capable node
   defp create_materializer(recovery_attempt, context) do
@@ -825,17 +860,20 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
     lock_fn.(service, epoch)
   end
 
-  defp default_lock_materializer({:materializer, name}, epoch) do
-    name
-    |> Materializer.lock_for_recovery(epoch)
-    |> case do
-      {:ok, pid, _info} -> {:ok, pid}
-      {:error, reason} -> {:error, {:materializer_lock_failed, reason}}
-    end
+  defp default_lock_materializer({:materializer, name}, epoch) when not is_integer(name) do
+    lock_materializer_by_name(name, epoch)
   end
 
   # Handle new format with shard_id
   defp default_lock_materializer({:materializer, name, _shard_id}, epoch) do
+    lock_materializer_by_name(name, epoch)
+  end
+
+  defp default_lock_materializer({{:materializer, _shard_id}, name}, epoch) do
+    lock_materializer_by_name(name, epoch)
+  end
+
+  defp lock_materializer_by_name(name, epoch) do
     name
     |> Materializer.lock_for_recovery(epoch)
     |> case do
