@@ -34,11 +34,17 @@ defmodule Bedrock.Service.Foreman.StartingWorkers do
   @spec try_to_start_workers([WorkerInfo.t()], cluster :: Cluster.t(), object_storage :: term()) ::
           [WorkerInfo.t()]
   def try_to_start_workers(worker_info, cluster, object_storage) do
+    # PATCHED (fuu): do not crash Foreman when worker startup times out.
     worker_info
-    |> Task.async_stream(&try_to_start_worker(&1, cluster, object_storage))
+    |> Task.async_stream(&try_to_start_worker(&1, cluster, object_storage),
+      timeout: 30_000,
+      on_timeout: :kill_task,
+      ordered: false,
+      zip_input_on_exit: true
+    )
     |> Enum.map(fn
-      {:ok, worker_info} -> worker_info
-      {:error, reason} -> put_health(worker_info, {:failed_to_start, reason})
+      {:ok, started_worker} -> started_worker
+      {:exit, {timed_out_worker, reason}} -> put_health(timed_out_worker, {:failed_to_start, reason})
     end)
     |> Enum.to_list()
   end

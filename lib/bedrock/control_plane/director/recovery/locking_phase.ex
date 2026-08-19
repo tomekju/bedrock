@@ -40,6 +40,11 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LockingPhase do
       {:error, :newer_epoch_exists} = error ->
         {recovery_attempt, error}
 
+      {:error, :waiting_for_log_locks} ->
+        # PATCHED (fuu): stall when old logs exist but none locked in time.
+        Logger.info("Old log services did not lock in time; waiting to retry")
+        {recovery_attempt, {:stalled, :waiting_for_log_locks}}
+
       {:ok, locked_service_ids, log_recovery_info_by_id, materializer_recovery_info_by_id, transaction_services,
        service_pids} ->
         updated_recovery_attempt =
@@ -75,8 +80,9 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LockingPhase do
              }
            }, service_pids :: %{Worker.id() => pid()}}
           | {:error, :newer_epoch_exists}
+          | {:error, :waiting_for_log_locks}
   def lock_old_system_services(old_system_services, epoch, context \\ %{}) do
-    timeout_in_ms = lock_old_system_services_timeout()
+    timeout_in_ms = Map.get(context, :lock_services_timeout_ms, lock_old_system_services_timeout())
 
     old_system_services
     |> Task.async_stream(
@@ -107,20 +113,28 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LockingPhase do
 
       {:ok, {_id, _, {:error, _}}}, acc ->
         {:cont, acc}
+
+      # PATCHED (fuu): ignore lock timeouts from Task.async_stream instead of crashing.
+      {:exit, {_input, _reason}}, acc ->
+        {:cont, acc}
     end)
     |> case do
       {:error, _reason} = error ->
         error
 
       {locked_ids, info_by_id, transaction_services, service_pids} ->
-        grouped_recovery_info = Enum.group_by(info_by_id, &Map.get(elem(&1, 1), :kind))
-        new_log_recovery_info_by_id = grouped_recovery_info |> Map.get(:log, []) |> Map.new()
+        if map_size(old_system_services) > 0 and MapSet.size(locked_ids) == 0 do
+          {:error, :waiting_for_log_locks}
+        else
+          grouped_recovery_info = Enum.group_by(info_by_id, &Map.get(elem(&1, 1), :kind))
+          new_log_recovery_info_by_id = grouped_recovery_info |> Map.get(:log, []) |> Map.new()
 
-        new_materializer_recovery_info_by_id =
-          grouped_recovery_info |> Map.get(:materializer, []) |> Map.new()
+          new_materializer_recovery_info_by_id =
+            grouped_recovery_info |> Map.get(:materializer, []) |> Map.new()
 
-        {:ok, locked_ids, new_log_recovery_info_by_id, new_materializer_recovery_info_by_id, transaction_services,
-         service_pids}
+          {:ok, locked_ids, new_log_recovery_info_by_id, new_materializer_recovery_info_by_id, transaction_services,
+           service_pids}
+        end
     end
   end
 
