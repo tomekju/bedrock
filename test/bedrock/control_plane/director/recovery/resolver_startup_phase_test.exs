@@ -5,6 +5,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.ResolverStartupPhaseTest do
 
   alias Bedrock.ControlPlane.Config.ResolverDescriptor
   alias Bedrock.ControlPlane.Director.Recovery.ResolverStartupPhase
+  alias Bedrock.ControlPlane.Director.Recovery.TopologyPhase
   alias Bedrock.DataPlane.Resolver.Server
 
   # Mock cluster module for testing
@@ -55,7 +56,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.ResolverStartupPhaseTest do
       {result, next_phase} = ResolverStartupPhase.execute(recovery_attempt, context)
 
       # Should transition to next phase with expected results
-      assert {%{resolvers: resolvers}, Bedrock.ControlPlane.Director.Recovery.TopologyPhase} =
+      assert {%{resolvers: resolvers}, TopologyPhase} =
                {result, next_phase}
 
       assert length(resolvers) == 2
@@ -80,6 +81,39 @@ defmodule Bedrock.ControlPlane.Director.Recovery.ResolverStartupPhaseTest do
       # Verify all nodes are used (order may vary due to non-deterministic iteration)
       nodes_used = Enum.map(captured_calls, fn {_child_spec, node} -> node end)
       assert Enum.sort(nodes_used) == [:node1, :node2]
+    end
+
+    test "starts resolvers at materializer current version when it is ahead of logs" do
+      agent = setup_capture_agent()
+      start_supervised_fn = capture_start_supervised_fn(agent)
+
+      recovery_attempt =
+        recovery_attempt()
+        |> with_cluster(TestCluster)
+        |> with_epoch(42)
+        |> with_version_vector({5, 100})
+        |> with_resolvers([ResolverDescriptor.resolver_descriptor("a", {:vacancy, 1})])
+
+      context = %{
+        node_capabilities: %{coordination: [:node1]},
+        lock_token: "test_lock_token",
+        start_supervised_fn: start_supervised_fn,
+        available_services: %{
+          "otqxhlks" => {{:materializer, 0}, {:test_materializer, node()}}
+        },
+        materializer_info_fn: fn _ref, _facts ->
+          {:ok, %{current_version: 5_000, durable_version: 5_000}}
+        end
+      }
+
+      {_result, TopologyPhase} =
+        ResolverStartupPhase.execute(recovery_attempt, context)
+
+      assert [
+               {%{
+                  start: {GenServer, :start_link, [Server, {_lock_token, 5_000, 42, _director, 1000, 6000}]}
+                }, :node1}
+             ] = get_captured_calls(agent)
     end
 
     test "stalls when no coordination capable nodes available" do

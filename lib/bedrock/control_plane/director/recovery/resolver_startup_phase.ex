@@ -23,6 +23,8 @@ defmodule Bedrock.ControlPlane.Director.Recovery.ResolverStartupPhase do
   alias Bedrock.ControlPlane.Director.Recovery.Shared
   alias Bedrock.DataPlane.Resolver
 
+  require Logger
+
   @impl true
   def execute(recovery_attempt, context) do
     start_supervised_fn =
@@ -33,7 +35,14 @@ defmodule Bedrock.ControlPlane.Director.Recovery.ResolverStartupPhase do
       end)
 
     available_resolver_nodes = Map.get(context.node_capabilities, :coordination, [])
-    {_first_version, last_committed_version} = recovery_attempt.version_vector
+    {_first_version, log_last_version} = recovery_attempt.version_vector
+    last_committed_version = Shared.max_committed_version(log_last_version, context)
+
+    if last_committed_version != log_last_version do
+      Logger.info(
+        "PATCHED (fuu): start resolvers at max of log and materializer versions; log=#{inspect(log_last_version)} resolvers=#{inspect(last_committed_version)}"
+      )
+    end
 
     resolver_context = %{
       resolvers: recovery_attempt.resolvers,
