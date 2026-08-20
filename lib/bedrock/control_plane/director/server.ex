@@ -15,7 +15,9 @@ defmodule Bedrock.ControlPlane.Director.Server do
 
   import Bedrock.ControlPlane.Director.Recovery,
     only: [
-      try_to_recover: 1
+      try_to_recover: 1,
+      persist_config: 1,
+      persist_new_transaction_system_layout: 1
     ]
 
   import Bedrock.Internal.GenServer.Replies
@@ -90,16 +92,45 @@ defmodule Bedrock.ControlPlane.Director.Server do
   end
 
   @impl true
+  def handle_info(:retry_stalled_recovery, %{persist_waiting: true} = t) do
+    noreply(t)
+  end
+
   def handle_info(:retry_stalled_recovery, t) do
     send(self(), :run_recovery)
     noreply(t)
   end
 
   @impl true
+  def handle_info(:run_recovery, %{persist_waiting: true} = t) do
+    noreply(t)
+  end
+
   def handle_info(:run_recovery, t) do
     t
     |> try_to_recover()
     |> noreply()
+  end
+
+  def handle_info({:system_transaction_result, {:ok, completed}}, t) do
+    # PATCHED (fuu): finish recovery after off-director system transaction.
+    t =
+      t
+      |> Map.delete(:persist_waiting)
+      |> Map.put(:state, :running)
+      |> Map.put(:recovery_attempt, completed)
+      |> Map.update!(:config, fn config -> Map.delete(config, :recovery_attempt) end)
+      |> Map.put(:transaction_system_layout, completed.transaction_system_layout)
+
+    t = persist_config(t)
+    t = persist_new_transaction_system_layout(t)
+    noreply(t)
+  end
+
+  def handle_info({:system_transaction_result, {:error, reason}}, t) do
+    Logger.warning("System transaction persist failed: #{inspect(reason)}")
+    Process.send_after(self(), :retry_stalled_recovery, 2_000)
+    noreply(Map.delete(t, :persist_waiting))
   end
 
   @impl true
@@ -110,6 +141,13 @@ defmodule Bedrock.ControlPlane.Director.Server do
   end
 
   @impl true
+  def handle_info({:DOWN, _monitor_ref, :process, failed_pid, reason}, %{persist_waiting: true} = t) do
+    # PATCHED (fuu): a commit-proxy/log death during off-director persist must
+    # not take the Director down; the spawn reports {:error, reason} instead.
+    Logger.warning("Component #{inspect(failed_pid)} failed during persist: #{inspect(reason)}")
+    noreply(t)
+  end
+
   def handle_info({:DOWN, _monitor_ref, :process, failed_pid, reason}, t) do
     t
     |> Map.put(:state, :stopped)

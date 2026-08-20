@@ -60,5 +60,15 @@ defmodule Bedrock.ControlPlane.Director.Recovery.PersistencePhaseTest do
       assert {_, {:stalled, {:recovery_system_failed, :timeout}}} =
                PersistencePhase.execute(recovery_attempt, context)
     end
+
+    test "defers persist off the director when no commit function is injected" do
+      recovery_attempt = with_proxies(base_recovery_attempt(), [])
+      context = recovery_context()
+
+      assert {^recovery_attempt, {:stalled, :waiting_for_system_transaction}} =
+               PersistencePhase.execute(recovery_attempt, context)
+
+      assert_receive {:system_transaction_result, {:error, :no_commit_proxies}}, 2_000
+    end
   end
 end

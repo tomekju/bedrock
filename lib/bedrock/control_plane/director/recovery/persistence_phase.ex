@@ -36,6 +36,32 @@ defmodule Bedrock.ControlPlane.Director.Recovery.PersistencePhase do
 
   @impl true
   def execute(recovery_attempt, context) do
+    # PATCHED (fuu): never GenServer.call the commit proxy from the director.
+    # CommitProxy.commit uses :infinity and log push uses :infinity; if a log
+    # is waiting on the director the nested call deadlocks and TSL never
+    # publishes. Tests inject commit_transaction_fn and stay synchronous.
+    if Map.has_key?(context, :commit_transaction_fn) do
+      persist_system_transaction_result(recovery_attempt, persist_system_transaction(recovery_attempt, context))
+    else
+      parent = self()
+
+      spawn(fn ->
+        result =
+          try do
+            persist_system_transaction(recovery_attempt, context)
+          catch
+            :exit, reason -> {:error, reason}
+          end
+
+        send(parent, {:system_transaction_result, result})
+      end)
+
+      {recovery_attempt, {:stalled, :waiting_for_system_transaction}}
+    end
+  end
+
+  @doc false
+  def persist_system_transaction(recovery_attempt, context) do
     trace_recovery_persisting_system_state()
 
     transaction_system_layout = recovery_attempt.transaction_system_layout
@@ -54,19 +80,27 @@ defmodule Bedrock.ControlPlane.Director.Recovery.PersistencePhase do
 
         case write_state_to_object_storage(recovery_attempt, context.cluster_config, transaction_system_layout) do
           :ok ->
-            {recovery_attempt, :completed}
+            {:ok, recovery_attempt}
 
           {:error, :version_mismatch} ->
-            {recovery_attempt, {:stalled, {:recovery_system_failed, :bootstrap_version_mismatch}}}
+            {:error, :bootstrap_version_mismatch}
 
           {:error, reason} ->
-            {recovery_attempt, {:stalled, {:recovery_system_failed, {:bootstrap_write_failed, reason}}}}
+            {:error, {:bootstrap_write_failed, reason}}
         end
 
       {:error, reason} ->
         trace_recovery_system_transaction_failed(reason)
-        {recovery_attempt, {:stalled, {:recovery_system_failed, reason}}}
+        {:error, reason}
     end
+  end
+
+  defp persist_system_transaction_result(_recovery_attempt, {:ok, completed}) do
+    {completed, :completed}
+  end
+
+  defp persist_system_transaction_result(recovery_attempt, {:error, reason}) do
+    {recovery_attempt, {:stalled, {:recovery_system_failed, reason}}}
   end
 
   defp write_state_to_object_storage(recovery_attempt, config, transaction_system_layout) do

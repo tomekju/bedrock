@@ -119,6 +119,17 @@ defmodule Bedrock.ControlPlane.Director.Recovery do
         |> persist_config()
         |> persist_new_transaction_system_layout()
 
+      {{:stalled, :waiting_for_system_transaction}, stalled} ->
+        # PATCHED (fuu): persist the system transaction off the Director so
+        # pending log/proxy calls can be answered. Do not retry from scratch
+        # until that spawn replies.
+        t
+        |> Map.put(:persist_waiting, true)
+        |> Map.put(:recovery_attempt, stalled)
+        |> Map.update!(:config, fn config ->
+          Map.put(config, :recovery_attempt, stalled)
+        end)
+
       {{:stalled, reason}, stalled} ->
         trace_recovery_stalled(Interval.between(stalled.started_at, now()), reason)
         # PATCHED (fuu): retry stalled recovery after a short delay even if no
