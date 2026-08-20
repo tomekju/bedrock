@@ -71,6 +71,18 @@ defmodule Bedrock.DataPlane.CommitProxy.Finalization do
   @type async_stream_fn() :: (enumerable :: Enumerable.t(), fun :: (term() -> term()), opts :: keyword() ->
                                 Enumerable.t())
 
+  @doc false
+  @spec sequential_stream(Enumerable.t(), (term() -> term()), keyword()) :: Enumerable.t()
+  def sequential_stream(enumerable, fun, _opts \\ []) do
+    Stream.map(enumerable, fn item ->
+      try do
+        {:ok, fun.(item)}
+      catch
+        :exit, reason -> {:exit, reason}
+      end
+    end)
+  end
+
   @type abort_reply_fn() :: ([Batch.reply_fn()] -> :ok)
 
   @type success_reply_fn() :: ([{Batch.reply_fn(), non_neg_integer(), non_neg_integer()}], Bedrock.version() -> :ok)
@@ -447,7 +459,10 @@ defmodule Bedrock.DataPlane.CommitProxy.Finalization do
          resolvers,
          opts
        ) do
-    async_stream_fn = Keyword.get(opts, :async_stream_fn, &Task.async_stream/3)
+    # PATCHED (fuu): resolve sequentially. Task.async_stream inside commit
+    # finalization times out on Elixir 1.20 (Task.Supervised.stream 5000) even
+    # when the same resolver calls succeed, and the exit crashes the Director.
+    async_stream_fn = Keyword.get(opts, :async_stream_fn, &sequential_stream/3)
     timeout = Keyword.get(opts, :timeout, 5_000)
 
     resolvers
@@ -909,7 +924,9 @@ defmodule Bedrock.DataPlane.CommitProxy.Finalization do
         ) :: :ok | {:error, log_push_error()}
   def push_transaction_to_logs_direct(last_commit_version, transactions_by_log, _commit_version, opts) do
     log_services = Keyword.fetch!(opts, :log_services)
-    async_stream_fn = Keyword.get(opts, :async_stream_fn, &Task.async_stream/3)
+    # PATCHED (fuu): push logs sequentially. Task.async_stream inside commit
+    # finalization times out on Elixir 1.20 and crashes the Director.
+    async_stream_fn = Keyword.get(opts, :async_stream_fn, &sequential_stream/3)
     log_push_fn = Keyword.get(opts, :log_push_fn, &try_to_push_transaction_to_log_direct/3)
     timeout = Keyword.get(opts, :timeout, 5_000)
 

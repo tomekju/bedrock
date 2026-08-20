@@ -612,4 +612,13 @@ defmodule Bedrock.DataPlane.CommitProxy.FinalizationLogPushTest do
       assert_receive {:reply2, {:error, :aborted}}
     end
   end
+
+  describe "sequential_stream/3" do
+    test "emits Task.async_stream-shaped ok tuples in order" do
+      assert [{:ok, 2}, {:ok, 4}, {:ok, 6}] =
+               [1, 2, 3]
+               |> Finalization.sequential_stream(&(&1 * 2), timeout: 5_000)
+               |> Enum.to_list()
+    end
+  end
 end
