@@ -206,7 +206,8 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
 
   # PATCHED (fuu): reuse an issued snapshotless token across recovery epochs.
   # Two directors or a retry bump the epoch; the stored token still admits the
-  # first-boot materializer as long as the shard, version, and issued state match.
+  # first-boot materializer as long as the shard, version, and issued/consumed
+  # state match. Consumed means a prior attempt already started that shard.
   defp validate_issued_snapshotless_token(backend, key, expected) do
     case ObjectStorage.get(backend, key) do
       {:ok, data} ->
@@ -218,9 +219,10 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
             kind: :initial_snapshotless_materializer,
             version: version,
             shard_tag: shard_tag,
-            state: :issued
+            state: state
           }
-          when version == expected.version and shard_tag == expected.shard_tag ->
+          when version == expected.version and shard_tag == expected.shard_tag and
+                 state in [:issued, :consumed] ->
             :ok
 
           _other ->
