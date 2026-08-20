@@ -204,12 +204,27 @@ defmodule Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase do
     end
   end
 
+  # PATCHED (fuu): reuse an issued snapshotless token across recovery epochs.
+  # Two directors or a retry bump the epoch; the stored token still admits the
+  # first-boot materializer as long as the shard, version, and issued state match.
   defp validate_issued_snapshotless_token(backend, key, expected) do
     case ObjectStorage.get(backend, key) do
       {:ok, data} ->
         case :erlang.binary_to_term(data, [:safe]) do
-          ^expected -> :ok
-          _other -> {:error, :initial_snapshotless_token_not_reusable}
+          ^expected ->
+            :ok
+
+          %{
+            kind: :initial_snapshotless_materializer,
+            version: version,
+            shard_tag: shard_tag,
+            state: :issued
+          }
+          when version == expected.version and shard_tag == expected.shard_tag ->
+            :ok
+
+          _other ->
+            {:error, :initial_snapshotless_token_not_reusable}
         end
 
       {:error, reason} ->
