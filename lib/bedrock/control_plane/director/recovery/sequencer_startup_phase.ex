@@ -25,7 +25,9 @@ defmodule Bedrock.ControlPlane.Director.Recovery.SequencerStartupPhase do
 
   alias Bedrock.ControlPlane.Config.RecoveryAttempt
   alias Bedrock.ControlPlane.Director.Recovery.Shared
+  alias Bedrock.DataPlane.Log
   alias Bedrock.DataPlane.Sequencer
+  alias Bedrock.DataPlane.Version
 
   require Logger
 
@@ -38,11 +40,19 @@ defmodule Bedrock.ControlPlane.Director.Recovery.SequencerStartupPhase do
   @impl true
   def execute(recovery_attempt, context) do
     starter_fn = get_starter_function(recovery_attempt, context)
+    {_first_version, log_last_version} = recovery_attempt.version_vector
+    last_committed_version = Shared.max_committed_version(log_last_version, context)
 
-    recovery_attempt
-    |> build_sequencer_child_spec(context)
-    |> starter_fn.(node())
-    |> handle_sequencer_result(recovery_attempt)
+    case advance_recruited_logs(recovery_attempt, context, log_last_version, last_committed_version) do
+      :ok ->
+        recovery_attempt
+        |> build_sequencer_child_spec(context)
+        |> starter_fn.(node())
+        |> handle_sequencer_result(recovery_attempt)
+
+      {:error, reason} ->
+        {recovery_attempt, {:stalled, reason}}
+    end
   end
 
   # Private helper functions
@@ -87,4 +97,103 @@ defmodule Bedrock.ControlPlane.Director.Recovery.SequencerStartupPhase do
   defp handle_sequencer_result({:error, reason}, recovery_attempt) do
     {recovery_attempt, {:error, {:failed_to_start, :sequencer, node(), reason}}}
   end
+
+  # PATCHED (fuu): when the sequencer will start ahead of recovered logs,
+  # jump each recruited log's last_version first. Log.push queues forever
+  # when expected_version > last_version, which deadlocks TSL persist.
+  defp advance_recruited_logs(_recovery_attempt, _context, log_last_version, last_committed_version)
+       when log_last_version == last_committed_version do
+    :ok
+  end
+
+  defp advance_recruited_logs(recovery_attempt, context, log_last_version, last_committed_version) do
+    if version_gt?(last_committed_version, log_last_version) do
+      target_version = as_version(last_committed_version)
+      log_entries = recruited_log_pids(recovery_attempt)
+
+      if log_entries == [] do
+        :ok
+      else
+        Logger.info(
+          "PATCHED (fuu): advance recruited logs to the sequencer start version; log=#{inspect(log_last_version)} target=#{inspect(target_version)}"
+        )
+
+        do_advance_recruited_logs(log_entries, target_version, context)
+      end
+    else
+      :ok
+    end
+  end
+
+  defp do_advance_recruited_logs(log_entries, target_version, context) do
+    advance_fn = Map.get(context, :advance_log_fn, &default_advance_log/3)
+    injected? = Map.has_key?(context, :advance_log_fn)
+
+    log_entries
+    |> Enum.reduce_while(%{}, fn {log_id, pid}, failures ->
+      result = advance_one_log(advance_fn, log_id, pid, target_version, injected?)
+
+      case result do
+        :ok -> {:cont, failures}
+        {:error, reason} -> {:cont, Map.put(failures, log_id, reason)}
+        other -> {:cont, Map.put(failures, log_id, other)}
+      end
+    end)
+    |> case do
+      failures when failures == %{} -> :ok
+      failures -> {:error, {:failed_to_advance_logs, failures}}
+    end
+  end
+
+  defp recruited_log_pids(recovery_attempt) do
+    logs = Map.get(recovery_attempt, :logs) || %{}
+    service_pids = Map.get(recovery_attempt, :service_pids) || %{}
+
+    Enum.map(Map.keys(logs), fn log_id -> {log_id, Map.get(service_pids, log_id)} end)
+  end
+
+  defp advance_one_log(_advance_fn, log_id, nil, _target_version, _injected?) do
+    {:error, {:missing_log_pid, log_id}}
+  end
+
+  defp advance_one_log(advance_fn, log_id, pid, target_version, true) do
+    advance_fn.(log_id, pid, target_version)
+  end
+
+  defp advance_one_log(advance_fn, log_id, pid, target_version, false) do
+    parent = self()
+    request_ref = make_ref()
+
+    {spawned_pid, monitor_ref} =
+      spawn_monitor(fn ->
+        send(parent, {:advance_log_result, request_ref, advance_fn.(log_id, pid, target_version)})
+      end)
+
+    receive do
+      {:advance_log_result, ^request_ref, result} ->
+        Process.demonitor(monitor_ref, [:flush])
+        result
+
+      {:DOWN, ^monitor_ref, :process, ^spawned_pid, reason} ->
+        {:error, reason}
+    after
+      30_000 ->
+        Process.exit(spawned_pid, :kill)
+        {:error, :timeout}
+    end
+  end
+
+  defp default_advance_log(_log_id, pid, target_version) do
+    Log.advance_last_version(pid, target_version)
+  end
+
+  defp as_version(version) when is_integer(version) and version >= 0, do: Version.from_integer(version)
+  defp as_version(<<_::unsigned-big-64>> = version), do: version
+
+  defp version_gt?(left, right) do
+    version_rank(left) > version_rank(right)
+  end
+
+  defp version_rank(version) when is_integer(version), do: version
+  defp version_rank(<<version::unsigned-big-64>>), do: version
 end

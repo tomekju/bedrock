@@ -174,6 +174,26 @@ defmodule Bedrock.DataPlane.Log.Shale.RecoveryTest do
     end
   end
 
+  describe "advance_last_version/2" do
+    test "jumps last_version forward with a gap sentinel", %{state: state} do
+      assert {:ok, recovered} = Recovery.recover_from(state, [], version(5), version(5))
+      assert recovered.last_version == version(5)
+
+      assert {:ok, advanced} = Recovery.advance_last_version(recovered, version(50))
+      assert advanced.last_version == version(50)
+    end
+
+    test "is a no-op when the target equals last_version", %{state: state} do
+      assert {:ok, recovered} = Recovery.recover_from(state, [], version(5), version(5))
+      assert {:ok, ^recovered} = Recovery.advance_last_version(recovered, version(5))
+    end
+
+    test "rejects a target behind last_version", %{state: state} do
+      assert {:ok, recovered} = Recovery.recover_from(state, [], version(5), version(5))
+      assert {:error, :version_too_old} = Recovery.advance_last_version(recovered, version(1))
+    end
+  end
+
   defp create_encoded_tx(version, data) do
     mutations = Enum.map(data, fn {key, value} -> {:set, key, value} end)
 

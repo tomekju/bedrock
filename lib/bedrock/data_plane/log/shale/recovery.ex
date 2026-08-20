@@ -271,4 +271,43 @@ defmodule Bedrock.DataPlane.Log.Shale.Recovery do
       {:error, _} -> raise "Failed to push sentinel"
     end
   end
+
+  @doc """
+  Jump `last_version` forward to `target` by writing an empty sentinel.
+
+  Used when recovered logs sit behind a materializer that already applied a later
+  sequencer epoch. The next `Log.push/3` expects `last_commit_version` to equal
+  the log's last version; without this jump it queues forever.
+  """
+  @spec advance_last_version(State.t(), Bedrock.version() | non_neg_integer()) ::
+          {:ok, State.t()} | {:error, :version_too_old | :tx_out_of_order | term()}
+  def advance_last_version(t, target) do
+    target_version = version_binary(target)
+    last_version = version_binary(t.last_version)
+
+    cond do
+      target_version == last_version ->
+        {:ok, t}
+
+      target_version > last_version ->
+        write_gap_sentinel(t, target_version)
+
+      true ->
+        {:error, :version_too_old}
+    end
+  end
+
+  defp version_binary(version) when is_binary(version) and byte_size(version) == 8, do: version
+  defp version_binary(version) when is_integer(version) and version >= 0, do: Version.from_integer(version)
+
+  defp write_gap_sentinel(t, target_version) do
+    encoded = Transaction.encode(%{mutations: []})
+    {:ok, sentinel} = Transaction.add_commit_version(encoded, target_version)
+
+    case push(t, t.last_version, sentinel, fn _ -> :ok end) do
+      {:ok, t} -> {:ok, t}
+      {:wait, _t} -> {:error, :tx_out_of_order}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 end

@@ -201,6 +201,18 @@ defmodule Bedrock.DataPlane.Log do
   def recover_from(log, source_logs, first_version, last_version),
     do: call(log, {:recover_from, normalize_source_logs(source_logs), first_version, last_version}, :infinity)
 
+  @doc """
+  Fast-forward a recovered log's last version to `target_version`.
+
+  Sequencer versions are last_committed plus elapsed monotonic microseconds, so a
+  later epoch can leave a materializer ahead of recovered logs. Recovery then
+  starts the sequencer at that materializer version. Without this jump, the first
+  `Log.push/3` queues forever because `expected_version > last_version`.
+  """
+  @spec advance_last_version(log :: ref(), target_version :: Bedrock.version() | non_neg_integer()) ::
+          :ok | {:error, :unavailable | :timeout | :version_too_old | term()}
+  def advance_last_version(log, target_version), do: call(log, {:advance_last_version, target_version}, 30_000)
+
   # Normalize source_logs to always be a list for consistent handling
   defp normalize_source_logs(nil), do: []
   defp normalize_source_logs([]), do: []

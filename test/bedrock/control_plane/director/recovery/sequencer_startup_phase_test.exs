@@ -3,6 +3,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.SequencerStartupPhaseTest do
 
   import Bedrock.Test.ControlPlane.RecoveryTestSupport
 
+  alias Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase
   alias Bedrock.ControlPlane.Director.Recovery.SequencerStartupPhase
   alias Bedrock.DataPlane.Sequencer.Server
 
@@ -57,7 +58,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.SequencerStartupPhaseTest do
       context = %{start_supervised_fn: start_supervised_fn}
 
       # Should transition to MaterializerBootstrapPhase with sequencer set
-      assert {%{sequencer: ^sequencer_pid}, Bedrock.ControlPlane.Director.Recovery.MaterializerBootstrapPhase} =
+      assert {%{sequencer: ^sequencer_pid}, MaterializerBootstrapPhase} =
                SequencerStartupPhase.execute(recovery_attempt, context)
 
       # Verify the child spec passed to start_supervised_fn
@@ -127,6 +128,83 @@ defmodule Bedrock.ControlPlane.Director.Recovery.SequencerStartupPhaseTest do
 
       assert %{start: {GenServer, :start_link, [_, {_director, 5, 5_000}, _]}} =
                Agent.get(agent, & &1)
+    end
+
+    test "advances recruited logs to the sequencer start version when materializers are ahead" do
+      agent = create_capture_agent()
+      log_pid = spawn(fn -> :ok end)
+
+      start_supervised_fn = fn child_spec, _node ->
+        Agent.update(agent, fn _ -> child_spec end)
+        {:ok, spawn(fn -> :ok end)}
+      end
+
+      {:ok, advanced} = Agent.start_link(fn -> [] end)
+
+      advance_log_fn = fn log_id, pid, target ->
+        Agent.update(advanced, fn calls -> [{log_id, pid, target} | calls] end)
+        :ok
+      end
+
+      recovery_attempt =
+        TestCluster
+        |> create_recovery_attempt(5, {25, 250})
+        |> Map.put(:logs, %{"log-1" => [], "log-2" => []})
+        |> Map.put(:service_pids, %{"log-1" => log_pid, "log-2" => log_pid})
+
+      context = %{
+        start_supervised_fn: start_supervised_fn,
+        advance_log_fn: advance_log_fn,
+        available_services: %{
+          "otqxhlks" => {{:materializer, 0}, {:test_materializer, node()}}
+        },
+        materializer_info_fn: fn _ref, _facts ->
+          {:ok, %{current_version: 5_000, durable_version: 5_000}}
+        end
+      }
+
+      assert {%{sequencer: sequencer}, MaterializerBootstrapPhase} =
+               SequencerStartupPhase.execute(recovery_attempt, context)
+
+      assert is_pid(sequencer)
+
+      assert %{start: {GenServer, :start_link, [_, {_director, 5, 5_000}, _]}} =
+               Agent.get(agent, & &1)
+
+      calls = Agent.get(advanced, &Enum.reverse/1)
+      target = Bedrock.DataPlane.Version.from_integer(5_000)
+
+      assert Enum.sort(calls) ==
+               Enum.sort([
+                 {"log-1", log_pid, target},
+                 {"log-2", log_pid, target}
+               ])
+    end
+
+    test "stalls recovery when a recruited log cannot be advanced" do
+      start_supervised_fn = fn _child_spec, _node ->
+        flunk("sequencer must not start when log advance fails")
+      end
+
+      recovery_attempt =
+        TestCluster
+        |> create_recovery_attempt(5, {25, 250})
+        |> Map.put(:logs, %{"log-1" => []})
+        |> Map.put(:service_pids, %{"log-1" => self()})
+
+      context = %{
+        start_supervised_fn: start_supervised_fn,
+        advance_log_fn: fn _log_id, _pid, _target -> {:error, :unavailable} end,
+        available_services: %{
+          "otqxhlks" => {{:materializer, 0}, {:test_materializer, node()}}
+        },
+        materializer_info_fn: fn _ref, _facts ->
+          {:ok, %{current_version: 5_000, durable_version: 5_000}}
+        end
+      }
+
+      assert {_attempt, {:stalled, {:failed_to_advance_logs, %{"log-1" => :unavailable}}}} =
+               SequencerStartupPhase.execute(recovery_attempt, context)
     end
   end
 end

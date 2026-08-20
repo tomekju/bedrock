@@ -16,7 +16,7 @@ defmodule Bedrock.DataPlane.Log.Shale.Server do
 
   import Bedrock.DataPlane.Log.Shale.Pulling, only: [pull: 3]
   import Bedrock.DataPlane.Log.Shale.Pushing, only: [push: 4]
-  import Bedrock.DataPlane.Log.Shale.Recovery, only: [recover_from: 4]
+  import Bedrock.DataPlane.Log.Shale.Recovery, only: [recover_from: 4, advance_last_version: 2]
   import Bedrock.DataPlane.Log.Telemetry
   import Bedrock.Internal.GenServer.Replies
 
@@ -186,6 +186,7 @@ defmodule Bedrock.DataPlane.Log.Shale.Server do
           {:info, [atom()]}
           | {:lock_for_recovery, Bedrock.epoch()}
           | {:recover_from, [pid()], Bedrock.version(), Bedrock.version()}
+          | {:advance_last_version, Bedrock.version() | non_neg_integer()}
           | {:push, binary(), Bedrock.version()}
           | {:pull, Bedrock.version(), keyword()}
           | :ping,
@@ -214,6 +215,14 @@ defmodule Bedrock.DataPlane.Log.Shale.Server do
     case recover_from(t, source_logs, first_version, last_version) do
       {:ok, t} -> reply(t, {:ok, self()})
       {:error, reason} -> reply(t, {:error, {:failed_to_recover, reason}})
+    end
+  end
+
+  @impl true
+  def handle_call({:advance_last_version, target}, _from, t) do
+    case advance_last_version(t, target) do
+      {:ok, t} -> reply(t, :ok)
+      {:error, reason} -> reply(t, {:error, reason})
     end
   end
 
