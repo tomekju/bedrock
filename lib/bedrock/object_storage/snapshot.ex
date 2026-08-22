@@ -40,6 +40,7 @@ defmodule Bedrock.ObjectStorage.Snapshot do
 
   alias Bedrock.ObjectStorage
   alias Bedrock.ObjectStorage.Keys
+  alias Bedrock.ObjectStorage.ListError
 
   @type version :: non_neg_integer()
   @type snapshot_data :: iodata()
@@ -97,12 +98,12 @@ defmodule Bedrock.ObjectStorage.Snapshot do
   def read_latest(%__MODULE__{} = snapshot) do
     prefix = Keys.snapshots_prefix(snapshot.shard_tag)
 
-    with [key] <- snapshot.backend |> ObjectStorage.list(prefix, limit: 1) |> Enum.take(1),
+    with {:ok, [key]} <- take_keys(snapshot.backend, prefix, 1),
          {:ok, version} <- Keys.extract_version(key),
          {:ok, data} <- ObjectStorage.get(snapshot.backend, key) do
       {:ok, version, data}
     else
-      [] -> {:error, :not_found}
+      {:ok, []} -> {:error, :not_found}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -154,17 +155,26 @@ defmodule Bedrock.ObjectStorage.Snapshot do
   - `{:ok, version}` - Latest version
   - `{:error, :not_found}` - No snapshots exist
   """
-  @spec latest_version(t()) :: {:ok, version()} | {:error, :not_found}
+  @spec latest_version(t()) :: {:ok, version()} | {:error, :not_found | term()}
   def latest_version(%__MODULE__{} = snapshot) do
     prefix = Keys.snapshots_prefix(snapshot.shard_tag)
 
-    case snapshot.backend |> ObjectStorage.list(prefix, limit: 1) |> Enum.take(1) do
-      [key] ->
+    case take_keys(snapshot.backend, prefix, 1) do
+      {:ok, [key]} ->
         Keys.extract_version(key)
 
-      [] ->
+      {:ok, []} ->
         {:error, :not_found}
+
+      {:error, reason} ->
+        {:error, reason}
     end
+  end
+
+  defp take_keys(backend, prefix, limit) do
+    {:ok, backend |> ObjectStorage.list(prefix, limit: limit) |> Enum.take(limit)}
+  rescue
+    error in ListError -> {:error, {:list_failed, error.reason}}
   end
 
   @doc """
@@ -219,8 +229,19 @@ defmodule Bedrock.ObjectStorage.Snapshot do
   @spec exists?(t()) :: boolean()
   def exists?(%__MODULE__{} = snapshot) do
     case latest_version(snapshot) do
-      {:ok, _} -> true
-      {:error, :not_found} -> false
+      {:ok, _} ->
+        true
+
+      {:error, :not_found} ->
+        false
+
+      {:error, {:list_failed, reason}} ->
+        {backend, _config} = snapshot.backend
+
+        raise ListError,
+          backend: backend,
+          prefix: Keys.snapshots_prefix(snapshot.shard_tag),
+          reason: reason
     end
   end
 

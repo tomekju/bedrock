@@ -8,6 +8,9 @@ defmodule Bedrock.ObjectStorage.S3 do
 
   @behaviour Bedrock.ObjectStorage
 
+  alias Bedrock.ObjectStorage
+  alias Bedrock.ObjectStorage.ListError
+
   @impl true
   def put(config, key, data, opts \\ []) do
     bucket = Keyword.fetch!(config, :bucket)
@@ -78,6 +81,9 @@ defmodule Bedrock.ObjectStorage.S3 do
       {:error, {:http_error, 412, _details}} ->
         {:error, :already_exists}
 
+      {:error, {:http_error, 409, details}} ->
+        {:error, {:conditional_request_conflict, details}}
+
       {:error, reason} ->
         {:error, reason}
     end
@@ -133,6 +139,9 @@ defmodule Bedrock.ObjectStorage.S3 do
         {:error, {:http_error, 412, _details}} ->
           resolve_conditional_write_failure(config, key)
 
+        {:error, {:http_error, 409, details}} ->
+          {:error, {:conditional_request_conflict, details}}
+
         {:error, reason} ->
           {:error, reason}
       end
@@ -156,8 +165,13 @@ defmodule Bedrock.ObjectStorage.S3 do
       {:ok, keys, continuation_token, exhausted?} ->
         next_list_item(%{state | buffer: keys, continuation_token: continuation_token, exhausted?: exhausted?})
 
-      {:error, _reason} ->
-        {:halt, %{state | exhausted?: true}}
+      {:error, reason} ->
+        {:error, normalized_reason} = ObjectStorage.normalize_error({:error, reason})
+
+        raise ListError,
+          backend: __MODULE__,
+          prefix: state.prefix,
+          reason: normalized_reason
     end
   end
 

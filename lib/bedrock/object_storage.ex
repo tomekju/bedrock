@@ -330,6 +330,8 @@ defmodule Bedrock.ObjectStorage do
   defp normalize_reason({:http_error, 404}), do: :not_found
   defp normalize_reason({:http_error, 409}), do: :already_exists
   defp normalize_reason({:http_error, 412}), do: :version_mismatch
+  defp normalize_reason({:http_error, status, _details}) when status in [401, 403], do: :access_denied
+  defp normalize_reason({:http_error, 404, _details}), do: :not_found
   defp normalize_reason({:precondition_failed, _reason}), do: :version_mismatch
   defp normalize_reason(reason), do: reason
 end

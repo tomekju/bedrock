@@ -55,6 +55,13 @@ defmodule Bedrock.ObjectStorage.ErrorContractTest do
   test "normalizes known error tuples and preserves unknown reasons" do
     assert {:error, :not_found} = ObjectStorage.normalize_error({:error, :enoent})
     assert {:error, :access_denied} = ObjectStorage.normalize_error({:error, {:http_error, 403}})
+
+    assert {:error, :access_denied} =
+             ObjectStorage.normalize_error({:error, {:http_error, 403, %{body: "denied"}}})
+
+    assert {:error, :not_found} =
+             ObjectStorage.normalize_error({:error, {:http_error, 404, %{body: "missing"}}})
+
     assert {:error, :version_mismatch} = ObjectStorage.normalize_error({:error, {:precondition_failed, :etag}})
     assert {:error, :custom_backend_error} = ObjectStorage.normalize_error({:error, :custom_backend_error})
   end

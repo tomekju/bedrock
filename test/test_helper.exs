@@ -89,6 +89,7 @@ end
 
 Mox.defmock(Bedrock.Raft.MockInterface, for: Bedrock.Raft.Interface)
 Mox.defmock(MockRepo, for: Bedrock.Repo)
+Mox.defmock(Bedrock.ObjectStorage.HttpClientMock, for: ExAws.Request.HttpClient)
 Mox.stub(MockRepo, :transact, fn callback -> callback.() end)
 
 # Define behavior for Resolver testing
