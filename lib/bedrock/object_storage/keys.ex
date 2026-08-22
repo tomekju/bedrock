@@ -86,6 +86,12 @@ defmodule Bedrock.ObjectStorage.Keys do
   @doc """
   Parses a base36-encoded inverted version string back to an integer.
 
+  Only the exact canonical form produced by `format_inverted_version/1` is
+  accepted: 13 characters, zero-padded, lowercase base36, within the u64
+  version range. Anything else — wrong width, uppercase, or an arbitrary
+  base36-parseable name such as `"object"` — is `:invalid_format`, so stray
+  keys under a version-keyed prefix can never decode into a bogus version.
+
   ## Examples
 
       iex> Keys.parse_inverted_version("0000000000000")
@@ -96,14 +102,27 @@ defmodule Bedrock.ObjectStorage.Keys do
 
       iex> Keys.parse_inverted_version("invalid!")
       {:error, :invalid_format}
+
+      iex> Keys.parse_inverted_version("object")
+      {:error, :invalid_format}
+
+      iex> Keys.parse_inverted_version("00000000000RS")
+      {:error, :invalid_format}
+
+      iex> Keys.parse_inverted_version("zzzzzzzzzzzzz")
+      {:error, :invalid_format}
   """
   @spec parse_inverted_version(String.t()) :: {:ok, non_neg_integer()} | {:error, :invalid_format}
-  def parse_inverted_version(str) when is_binary(str) do
-    case Integer.parse(str, 36) do
-      {value, ""} when value >= 0 -> {:ok, value}
+  def parse_inverted_version(str) when is_binary(str) and byte_size(str) == 13 do
+    with {value, ""} when value >= 0 and value <= @max_version <- Integer.parse(str, 36),
+         ^str <- format_inverted_version(value) do
+      {:ok, value}
+    else
       _ -> {:error, :invalid_format}
     end
   end
+
+  def parse_inverted_version(str) when is_binary(str), do: {:error, :invalid_format}
 
   @doc """
   Formats a version as an inverted, base36-encoded string key component.

@@ -96,15 +96,9 @@ defmodule Bedrock.ObjectStorage.Snapshot do
   """
   @spec read_latest(t()) :: {:ok, version(), snapshot_data()} | {:error, :not_found | term()}
   def read_latest(%__MODULE__{} = snapshot) do
-    prefix = Keys.snapshots_prefix(snapshot.shard_tag)
-
-    with {:ok, [key]} <- take_keys(snapshot.backend, prefix, 1),
-         {:ok, version} <- Keys.extract_version(key),
+    with {:ok, {version, key}} <- first_snapshot_entry(snapshot),
          {:ok, data} <- ObjectStorage.get(snapshot.backend, key) do
       {:ok, version, data}
-    else
-      {:ok, []} -> {:error, :not_found}
-      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -126,7 +120,9 @@ defmodule Bedrock.ObjectStorage.Snapshot do
   @doc """
   Lists all snapshots in newest-first order.
 
-  Returns a lazy stream of `{version, key}` tuples.
+  Returns a lazy stream of `{version, key}` tuples. Keys under the snapshots
+  prefix that are not canonical version-encoded snapshot names are ignored —
+  they can never decode into a bogus version entry.
 
   ## Options
 
@@ -157,22 +153,21 @@ defmodule Bedrock.ObjectStorage.Snapshot do
   """
   @spec latest_version(t()) :: {:ok, version()} | {:error, :not_found | term()}
   def latest_version(%__MODULE__{} = snapshot) do
-    prefix = Keys.snapshots_prefix(snapshot.shard_tag)
-
-    case take_keys(snapshot.backend, prefix, 1) do
-      {:ok, [key]} ->
-        Keys.extract_version(key)
-
-      {:ok, []} ->
-        {:error, :not_found}
-
-      {:error, reason} ->
-        {:error, reason}
+    with {:ok, {version, _key}} <- first_snapshot_entry(snapshot) do
+      {:ok, version}
     end
   end
 
-  defp take_keys(backend, prefix, limit) do
-    {:ok, backend |> ObjectStorage.list(prefix, limit: limit) |> Enum.take(limit)}
+  # Newest canonical snapshot entry, skipping any non-canonical keys under the
+  # prefix. Shares list/2's filtering so list, read_latest, and latest_version
+  # can never disagree about what counts as a snapshot.
+  @spec first_snapshot_entry(t()) ::
+          {:ok, {version(), String.t()}} | {:error, :not_found | {:list_failed, term()}}
+  defp first_snapshot_entry(%__MODULE__{} = snapshot) do
+    case snapshot |> list() |> Enum.take(1) do
+      [{version, key}] -> {:ok, {version, key}}
+      [] -> {:error, :not_found}
+    end
   rescue
     error in ListError -> {:error, {:list_failed, error.reason}}
   end

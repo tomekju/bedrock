@@ -254,4 +254,35 @@ defmodule Bedrock.ObjectStorage.SnapshotTest do
       assert state == %{key1: "v1", key2: "v2", key3: "v3"}
     end
   end
+
+  describe "non-canonical keys under the snapshots prefix" do
+    # Regression for the live Tigris gate: plain objects stored under the
+    # shard's "s/<tag>/" prefix must never decode into snapshot entries.
+    # "0-lock" sorts before every canonical key, so it also exercises the
+    # read_latest/latest_version first-key path; "object" sorts after.
+    test "list, read_latest, and latest_version all ignore them", %{backend: backend} do
+      snapshot = Snapshot.new(backend, "shard")
+      assert :ok = Snapshot.write(snapshot, 42, "canonical")
+
+      assert :ok = ObjectStorage.put(backend, "s/shard/0-lock", "stray-first")
+      assert :ok = ObjectStorage.put(backend, "s/shard/object", "stray-last")
+
+      canonical_key = Bedrock.ObjectStorage.Keys.snapshot_path("shard", 42)
+
+      assert [{42, ^canonical_key}] = snapshot |> Snapshot.list() |> Enum.to_list()
+      assert {:ok, 42, "canonical"} = Snapshot.read_latest(snapshot)
+      assert {:ok, 42} = Snapshot.latest_version(snapshot)
+    end
+
+    test "read_latest and latest_version stay :not_found with only stray keys", %{
+      backend: backend
+    } do
+      snapshot = Snapshot.new(backend, "shard")
+      assert :ok = ObjectStorage.put(backend, "s/shard/object", "stray")
+
+      assert [] = snapshot |> Snapshot.list() |> Enum.to_list()
+      assert {:error, :not_found} = Snapshot.read_latest(snapshot)
+      assert {:error, :not_found} = Snapshot.latest_version(snapshot)
+    end
+  end
 end
