@@ -29,6 +29,18 @@ defmodule Bedrock.ObjectStorage.ErrorContractTest do
     def put_if_version_matches(_config, _key, _version_token, _data, _opts), do: {:error, {:http_error, 412}}
   end
 
+  defmodule AdmittedFirstBootBackend do
+    @moduledoc false
+
+    def first_boot_admission_status(_config, _cluster_config), do: {:ok, :admitted}
+  end
+
+  defmodule InvalidFirstBootBackend do
+    @moduledoc false
+
+    def first_boot_admission_status(_config, _cluster_config), do: {:ok, :not_required}
+  end
+
   test "normalizes wrapper operations to canonical reasons" do
     backend = ObjectStorage.backend(RawErrorBackend, [])
 
@@ -45,5 +57,29 @@ defmodule Bedrock.ObjectStorage.ErrorContractTest do
     assert {:error, :access_denied} = ObjectStorage.normalize_error({:error, {:http_error, 403}})
     assert {:error, :version_mismatch} = ObjectStorage.normalize_error({:error, {:precondition_failed, :etag}})
     assert {:error, :custom_backend_error} = ObjectStorage.normalize_error({:error, :custom_backend_error})
+  end
+
+  describe "first_boot_admission_status/2" do
+    test "requires an explicit backend validator" do
+      assert {:error, :first_boot_admission_validator_missing} =
+               ObjectStorage.first_boot_admission_status(
+                 ObjectStorage.backend(RawErrorBackend, []),
+                 []
+               )
+    end
+
+    test "accepts only an admitted backend response" do
+      assert {:ok, :admitted} =
+               ObjectStorage.first_boot_admission_status(
+                 ObjectStorage.backend(AdmittedFirstBootBackend, []),
+                 []
+               )
+
+      assert {:error, {:invalid_first_boot_admission_status, {:ok, :not_required}}} =
+               ObjectStorage.first_boot_admission_status(
+                 ObjectStorage.backend(InvalidFirstBootBackend, []),
+                 []
+               )
+    end
   end
 end

@@ -173,7 +173,7 @@ defmodule Bedrock.ControlPlane.Coordinator.State do
         end)
         |> Map.new(fn {capability, nodes} ->
           # Filter out dead nodes
-          live_nodes = Enum.filter(nodes, &(Node.ping(&1) == :pong))
+          live_nodes = Enum.filter(nodes, &(&1 == Node.self() or Node.ping(&1) == :pong))
           {capability, live_nodes}
         end)
 

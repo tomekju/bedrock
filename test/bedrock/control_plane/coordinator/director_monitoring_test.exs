@@ -6,6 +6,20 @@ defmodule Bedrock.ControlPlane.Coordinator.DirectorMonitoringTest do
   alias Bedrock.ControlPlane.Coordinator.DirectorManagement
   alias Bedrock.ControlPlane.Coordinator.State
 
+  defmodule ConfiguredCluster do
+    @moduledoc false
+
+    def node_config do
+      [
+        parameters: %{
+          desired_coordinators: 3,
+          desired_logs: 3,
+          desired_replication_factor: 3
+        }
+      ]
+    end
+  end
+
   # Common test helpers
   defp create_director_pid, do: spawn(fn -> :timer.sleep(100) end)
 
@@ -26,6 +40,14 @@ defmodule Bedrock.ControlPlane.Coordinator.DirectorMonitoringTest do
   end
 
   describe "director management" do
+    test "fresh config uses the cluster's durability parameters" do
+      config = DirectorManagement.fresh_config(ConfiguredCluster, [node()])
+
+      assert config.parameters.desired_coordinators == 3
+      assert config.parameters.desired_logs == 3
+      assert config.parameters.desired_replication_factor == 3
+    end
+
     test "handle_director_failure processes failure for current director" do
       director_pid = create_director_pid()
       state = leader_state(director_pid)

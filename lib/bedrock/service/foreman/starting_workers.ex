@@ -34,11 +34,30 @@ defmodule Bedrock.Service.Foreman.StartingWorkers do
   @spec try_to_start_workers([WorkerInfo.t()], cluster :: Cluster.t(), object_storage :: term()) ::
           [WorkerInfo.t()]
   def try_to_start_workers(worker_info, cluster, object_storage) do
-    worker_info
-    |> Task.async_stream(&try_to_start_worker(&1, cluster, object_storage))
+    try_to_start_workers(worker_info, cluster, object_storage, [])
+  end
+
+  @doc false
+  @spec try_to_start_workers([WorkerInfo.t()], Cluster.t(), term(), keyword()) :: [WorkerInfo.t()]
+  def try_to_start_workers(worker_info, cluster, object_storage, opts) when is_list(opts) do
+    start_worker_fn =
+      Keyword.get(opts, :start_worker_fn, fn worker_info ->
+        try_to_start_worker(worker_info, cluster, object_storage)
+      end)
+
+    timeout_in_ms = Keyword.get(opts, :timeout_in_ms, 30_000)
+
+    :foreman_task_supervisor
+    |> cluster.otp_name()
+    |> Task.Supervisor.async_stream_nolink(worker_info, start_worker_fn,
+      timeout: timeout_in_ms,
+      on_timeout: :kill_task,
+      ordered: false,
+      zip_input_on_exit: true
+    )
     |> Enum.map(fn
-      {:ok, worker_info} -> worker_info
-      {:error, reason} -> put_health(worker_info, {:failed_to_start, reason})
+      {:ok, started_worker} -> started_worker
+      {:exit, {original_worker, reason}} -> put_health(original_worker, {:failed_to_start, reason})
     end)
     |> Enum.to_list()
   end

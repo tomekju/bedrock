@@ -15,6 +15,7 @@ defmodule Bedrock.ControlPlane.Config.RecoveryAttempt do
           :newer_epoch_exists
           | :waiting_for_services
           | :unable_to_meet_log_quorum
+          | {:transient_log_lock_timeouts, [Worker.id()]}
           | :no_unassigned_logs
           | {:source_log_unavailable, log_to_pull :: Log.ref()}
           | {:failed_to_start, :resolver | :commit_proxy | :sequencer, node(),
@@ -56,7 +57,8 @@ defmodule Bedrock.ControlPlane.Config.RecoveryAttempt do
     :metadata_materializer,
     :shard_layout,
     shard_materializers: %{},
-    lock_failed_service_ids: MapSet.new()
+    lock_failed_service_ids: MapSet.new(),
+    transient_log_lock_timeout_ids: MapSet.new()
   ]
 
   @type shard_layout :: %{Bedrock.key() => {Bedrock.range_tag(), Bedrock.key()}}
@@ -83,6 +85,7 @@ defmodule Bedrock.ControlPlane.Config.RecoveryAttempt do
           metadata_materializer: pid() | nil,
           shard_materializers: %{Bedrock.range_tag() => pid()},
           lock_failed_service_ids: MapSet.t(Worker.id()),
+          transient_log_lock_timeout_ids: MapSet.t(Worker.id()),
           shard_layout: shard_layout() | nil
         }
 
@@ -122,7 +125,8 @@ defmodule Bedrock.ControlPlane.Config.RecoveryAttempt do
       metadata_materializer: nil,
       shard_layout: nil,
       shard_materializers: %{},
-      lock_failed_service_ids: MapSet.new()
+      lock_failed_service_ids: MapSet.new(),
+      transient_log_lock_timeout_ids: MapSet.new()
     }
   end
 end

@@ -36,12 +36,16 @@ defmodule Bedrock.ControlPlane.Director.Recovery do
   alias Bedrock.Internal.Time.Interval
   alias Bedrock.Service.Worker
 
+  @max_transient_retries 3
+  @transient_retry_delay_ms 2_000
+
   @type recovery_context :: %{
           cluster_config: Config.t(),
           old_transaction_system_layout: TransactionSystemLayout.t(),
           node_capabilities: %{Bedrock.Cluster.capability() => [node()]},
           lock_token: binary(),
           available_services: %{Worker.id() => {atom(), {atom(), node()}}},
+          recovery_task_supervisor: GenServer.server(),
           coordinator: pid()
         }
 
@@ -61,6 +65,96 @@ defmodule Bedrock.ControlPlane.Director.Recovery do
 
   @spec try_to_recover(State.t()) :: State.t()
   def try_to_recover(t), do: t
+
+  @doc false
+  @spec reset_transient_recovery_retry(State.t()) :: State.t()
+  def reset_transient_recovery_retry(%{recovery_retry: %{timer_ref: timer_ref}} = t) when is_reference(timer_ref) do
+    Process.cancel_timer(timer_ref)
+    %{t | recovery_retry: nil}
+  end
+
+  def reset_transient_recovery_retry(%{} = t), do: %{t | recovery_retry: nil}
+
+  @doc false
+  @spec claim_transient_recovery_retry(State.t(), Bedrock.epoch(), non_neg_integer(), reference()) ::
+          {:ok, State.t()} | :stale
+  def claim_transient_recovery_retry(
+        %{
+          state: :recovery,
+          epoch: epoch,
+          recovery_attempt: %{attempt: attempt},
+          recovery_retry: %{epoch: epoch, stalled_attempt: attempt, token: token} = retry
+        } = t,
+        epoch,
+        attempt,
+        token
+      ) do
+    {:ok, %{t | recovery_retry: %{retry | timer_ref: nil}}}
+  end
+
+  def claim_transient_recovery_retry(_t, _epoch, _attempt, _token), do: :stale
+
+  @doc false
+  @spec retry_transient_recovery(State.t()) :: State.t()
+  def retry_transient_recovery(%{state: :recovery, recovery_retry: %{timer_ref: nil}} = t) do
+    t
+    |> setup_for_subsequent_recovery()
+    |> do_recovery()
+  end
+
+  @doc false
+  @spec schedule_transient_recovery_retry(State.t(), RecoveryAttempt.reason_for_stall()) :: State.t()
+  def schedule_transient_recovery_retry(
+        %{
+          epoch: epoch,
+          recovery_attempt: %{attempt: _stalled_attempt},
+          recovery_retry: %{epoch: epoch, timer_ref: timer_ref}
+        } = t,
+        {:transient_log_lock_timeouts, [_ | _]}
+      )
+      when is_reference(timer_ref) do
+    t
+  end
+
+  def schedule_transient_recovery_retry(
+        %{
+          epoch: epoch,
+          recovery_attempt: %{attempt: _stalled_attempt},
+          recovery_retry: %{epoch: epoch, retry_no: retry_no}
+        } = t,
+        {:transient_log_lock_timeouts, [_ | _]}
+      )
+      when retry_no >= @max_transient_retries do
+    t
+  end
+
+  def schedule_transient_recovery_retry(
+        %{epoch: epoch, recovery_attempt: %{attempt: stalled_attempt}} = t,
+        {:transient_log_lock_timeouts, [_ | _]}
+      ) do
+    retry_no = next_transient_retry_no(t, epoch)
+    token = make_ref()
+
+    timer_ref =
+      Process.send_after(
+        self(),
+        {:retry_stalled_recovery, epoch, stalled_attempt, token},
+        @transient_retry_delay_ms
+      )
+
+    %{
+      t
+      | recovery_retry: %{
+          epoch: epoch,
+          stalled_attempt: stalled_attempt,
+          retry_no: retry_no,
+          token: token,
+          timer_ref: timer_ref
+        }
+    }
+  end
+
+  def schedule_transient_recovery_retry(t, _reason), do: t
 
   @spec setup_for_initial_recovery(State.t()) :: State.t()
   def setup_for_initial_recovery(t) do
@@ -108,6 +202,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery do
       node_capabilities: t.node_capabilities,
       lock_token: t.lock_token,
       available_services: t.services,
+      recovery_task_supervisor: t.cluster.otp_name(:director_recovery_task_supervisor),
       coordinator: t.coordinator
     }
 
@@ -118,6 +213,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery do
         trace_recovery_completed(Interval.between(completed.started_at, now(), :microsecond))
 
         t
+        |> reset_transient_recovery_retry()
         |> Map.put(:state, :running)
         |> Map.update!(:config, fn config ->
           Map.delete(config, :recovery_attempt)
@@ -142,13 +238,17 @@ defmodule Bedrock.ControlPlane.Director.Recovery do
           Map.put(config, :recovery_attempt, stalled)
         end)
         |> persist_config()
+        |> schedule_transient_recovery_retry(reason)
 
       {{:error, reason}, _failed_attempt} ->
         # Errors are fatal - this director should stop trying to recover
         trace_recovery_failed(Interval.between(t.recovery_attempt.started_at, now()), reason)
-        t
+        reset_transient_recovery_retry(t)
     end
   end
+
+  defp next_transient_retry_no(%{recovery_retry: %{epoch: epoch, retry_no: retry_no}}, epoch), do: retry_no + 1
+  defp next_transient_retry_no(_t, _epoch), do: 1
 
   @doc """
   The directory ids a completed recovery's layout does not reference.

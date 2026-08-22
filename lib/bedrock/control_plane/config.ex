@@ -26,6 +26,12 @@ defmodule Bedrock.ControlPlane.Config do
 
   @type state :: :uninitialized | :recovery | :running | :stopping
 
+  @fresh_boot_parameter_keys [
+    :desired_coordinators,
+    :desired_logs,
+    :desired_replication_factor
+  ]
+
   @spec key_range(min_key :: Bedrock.key(), max_key_exclusive :: Bedrock.key()) ::
           Bedrock.key_range()
   def key_range(min_key, max_key_exclusive) when min_key < max_key_exclusive, do: {min_key, max_key_exclusive}
@@ -34,10 +40,19 @@ defmodule Bedrock.ControlPlane.Config do
   Creates a new `Config` struct.
   """
   @spec new(coordinators :: [node()]) :: t()
-  def new(coordinators) do
+  def new(coordinators), do: new(coordinators, %{})
+
+  @doc """
+  Creates a new `Config` with the allowed fresh-boot parameter overrides.
+  """
+  @spec new(coordinators :: [node()], parameter_overrides :: map()) :: t()
+  def new(coordinators, parameter_overrides) when is_map(parameter_overrides) do
     %{
       coordinators: coordinators,
-      parameters: Parameters.new(coordinators),
+      parameters:
+        coordinators
+        |> Parameters.new()
+        |> Map.merge(Map.take(parameter_overrides, @fresh_boot_parameter_keys)),
       policies: Policies.default_policies()
     }
   end

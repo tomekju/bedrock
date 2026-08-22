@@ -56,6 +56,12 @@ defmodule Bedrock.ControlPlane.Director.RecoveryTest do
     end
   end
 
+  setup do
+    start_supervised!({Task.Supervisor, name: TestCluster.otp_name(:director_recovery_task_supervisor)})
+
+    :ok
+  end
+
   # Mock phases that return completed or stalled states
   defmodule MockStartPhase do
     @moduledoc false

@@ -47,6 +47,7 @@ defmodule Bedrock.Internal.ClusterSupervisorTest do
 
       # Set up all the mock expectations needed for init
       expect(Bedrock.MockCluster, :otp_name, fn :sup -> :test_sup end)
+      expect(Bedrock.MockCluster, :otp_name, fn :director_recovery_task_supervisor -> :test_recovery_task_sup end)
       expect(Bedrock.MockCluster, :otp_name, fn :link -> :test_link end)
 
       assert_raise RuntimeError, "Unknown capability: :storage", fn ->

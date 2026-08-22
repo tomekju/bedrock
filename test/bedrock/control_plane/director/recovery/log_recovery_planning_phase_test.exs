@@ -73,6 +73,17 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogRecoveryPlanningPhaseTest do
       assert {:stalled, :unable_to_meet_log_quorum} = next_phase_or_stall
     end
 
+    test "tags a quorum stall caused by transient log lock timeouts" do
+      old_logs = %{"log-a" => %{}, "log-b" => %{}, "log-c" => %{}}
+      {recovery_attempt, context} = recovery_setup(%{}, old_logs, 3)
+
+      recovery_attempt =
+        Map.put(recovery_attempt, :transient_log_lock_timeout_ids, MapSet.new(["log-b", "log-a"]))
+
+      assert {_, {:stalled, {:transient_log_lock_timeouts, ["log-a", "log-b"]}}} =
+               LogRecoveryPlanningPhase.execute(recovery_attempt, context)
+    end
+
     test "stalls recovery when no logs available" do
       {recovery_attempt, context} = recovery_setup(%{}, %{}, 3)
 

@@ -23,6 +23,23 @@ defmodule Bedrock.ControlPlane.ConfigTest do
     end
   end
 
+  describe "new/2" do
+    test "applies only allowed fresh-boot parameter overrides" do
+      config =
+        Config.new([node()], %{
+          desired_coordinators: 3,
+          desired_logs: 3,
+          desired_replication_factor: 3,
+          unexpected_parameter: :ignored
+        })
+
+      assert config.parameters.desired_coordinators == 3
+      assert config.parameters.desired_logs == 3
+      assert config.parameters.desired_replication_factor == 3
+      refute Map.has_key?(config.parameters, :unexpected_parameter)
+    end
+  end
+
   describe "allow_volunteer_nodes_to_join?/1" do
     test "returns true by default from a real config" do
       config = Config.new([node()])

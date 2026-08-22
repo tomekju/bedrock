@@ -69,7 +69,15 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogRecoveryPlanningPhase do
           {recovery_attempt, {:stalled, :unable_to_meet_log_quorum}}
       end
     else
-      {recovery_attempt, {:stalled, :unable_to_meet_log_quorum}}
+      {recovery_attempt, {:stalled, quorum_stall_reason(recovery_attempt)}}
+    end
+  end
+
+  defp quorum_stall_reason(%RecoveryAttempt{transient_log_lock_timeout_ids: timed_out_log_ids}) do
+    if MapSet.size(timed_out_log_ids) > 0 do
+      {:transient_log_lock_timeouts, timed_out_log_ids |> MapSet.to_list() |> Enum.sort()}
+    else
+      :unable_to_meet_log_quorum
     end
   end
 

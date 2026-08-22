@@ -51,9 +51,18 @@ defmodule Bedrock.ControlPlane.Coordinator.DirectorManagement do
   def try_to_start_director(t), do: t
 
   @spec maybe_put_default_config(State.t()) :: State.t()
-  defp maybe_put_default_config(%{config: nil} = t), do: put_config(t, Config.new(Bedrock.Raft.known_peers(t.raft)))
+  defp maybe_put_default_config(%{config: nil} = t) do
+    put_config(t, fresh_config(t.cluster, Bedrock.Raft.known_peers(t.raft)))
+  end
 
   defp maybe_put_default_config(t), do: t
+
+  @doc false
+  @spec fresh_config(module(), [node()]) :: Config.t()
+  def fresh_config(cluster, coordinators) do
+    parameter_overrides = Keyword.get(cluster.node_config(), :parameters, %{})
+    Config.new(coordinators, parameter_overrides)
+  end
 
   @spec start_director_with_monitoring(State.t()) ::
           {:ok, pid()} | {:error, term()}

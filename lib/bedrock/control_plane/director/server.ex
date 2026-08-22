@@ -15,6 +15,9 @@ defmodule Bedrock.ControlPlane.Director.Server do
 
   import Bedrock.ControlPlane.Director.Recovery,
     only: [
+      claim_transient_recovery_retry: 4,
+      reset_transient_recovery_retry: 1,
+      retry_transient_recovery: 1,
       try_to_recover: 1
     ]
 
@@ -88,6 +91,14 @@ defmodule Bedrock.ControlPlane.Director.Server do
   end
 
   @impl true
+  def handle_info({:retry_stalled_recovery, epoch, stalled_attempt, token}, %State{} = t) do
+    case claim_transient_recovery_retry(t, epoch, stalled_attempt, token) do
+      {:ok, t} -> t |> retry_transient_recovery() |> noreply()
+      :stale -> noreply(t)
+    end
+  end
+
+  @impl true
   def handle_info({:timeout, :ping_all_coordinators}, t) do
     t
     |> ping_all_coordinators()
@@ -126,6 +137,7 @@ defmodule Bedrock.ControlPlane.Director.Server do
     {:ok, updated_t} = request_to_rejoin(t, node, capabilities, Map.values(running_services), now())
 
     updated_t
+    |> reset_transient_recovery_retry()
     |> try_to_recover()
     |> reply(:ok)
   end
@@ -147,6 +159,7 @@ defmodule Bedrock.ControlPlane.Director.Server do
   def handle_cast({:node_added_worker, node, worker_info}, %State{} = t) do
     t
     |> node_added_worker(node, worker_info, now())
+    |> reset_transient_recovery_retry()
     |> try_to_recover()
     |> noreply()
   end
@@ -201,7 +214,9 @@ defmodule Bedrock.ControlPlane.Director.Server do
   def try_to_recover_if_stalled(%{state: :recovery} = t) do
     # If we're in recovery state, new services might resolve insufficient_nodes
     # So we should retry recovery
-    try_to_recover(t)
+    t
+    |> reset_transient_recovery_retry()
+    |> try_to_recover()
   end
 
   def try_to_recover_if_stalled(t) do

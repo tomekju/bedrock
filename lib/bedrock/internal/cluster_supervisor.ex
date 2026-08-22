@@ -142,6 +142,7 @@ defmodule Bedrock.Internal.ClusterSupervisor do
     children =
       [
         {DynamicSupervisor, name: cluster.otp_name(:sup)},
+        {Task.Supervisor, name: cluster.otp_name(:director_recovery_task_supervisor)},
         {Link,
          [
            cluster: cluster,

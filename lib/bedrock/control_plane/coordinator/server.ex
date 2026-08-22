@@ -88,9 +88,9 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
 
     with {:ok, coordinator_nodes} <- cluster.fetch_coordinator_nodes(),
          true <- my_node in coordinator_nodes || {:error, :not_a_coordinator},
-         {:ok, raft_log} <- init_raft_log(cluster) do
-      # Load config and old TSL from object storage (source of truth)
-      {loaded_epoch, loaded_config, loaded_tsl} = load_state_from_object_storage(cluster)
+         {:ok, raft_log} <- init_raft_log(cluster),
+         {:ok, {loaded_epoch, loaded_config, loaded_tsl}} <- load_state_from_object_storage(cluster) do
+      # The only nil config is a backend-admitted pristine first boot.
 
       {:ok,
        %State{
@@ -114,6 +114,7 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
     else
       {:error, :unavailable} -> :ignore
       {:error, :not_a_coordinator} -> :ignore
+      {:error, reason} -> {:stop, {:bootstrap_load_failed, reason}}
     end
   end
 
@@ -448,21 +449,44 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
   # Object Storage loading functions
 
   @spec load_state_from_object_storage(module()) ::
-          {Bedrock.epoch() | nil, map() | nil, map() | nil}
+          {:ok, {Bedrock.epoch() | nil, map() | nil, map() | nil}} | {:error, term()}
   defp load_state_from_object_storage(cluster) do
-    with {:ok, backend} <- get_object_storage_backend(cluster),
-         {:ok, data} <- fetch_bootstrap_data(backend, cluster),
-         {:ok, bootstrap} <- parse_bootstrap_data(data, cluster) do
-      epoch = bootstrap.epoch
-      config = build_config_from_bootstrap(bootstrap, cluster)
-      old_tsl = build_old_tsl_from_bootstrap(bootstrap)
+    case get_object_storage_backend(cluster) do
+      {:ok, backend} ->
+        case fetch_bootstrap_data(backend, cluster) do
+          {:ok, data} ->
+            case parse_bootstrap_data(data, cluster) do
+              {:ok, bootstrap} ->
+                epoch = bootstrap.epoch
+                config = build_config_from_bootstrap(bootstrap, cluster)
+                old_tsl = build_old_tsl_from_bootstrap(bootstrap)
 
-      Logger.info("Bedrock [#{cluster}]: Loaded cluster bootstrap from object storage (epoch: #{epoch})")
-      {epoch, config, old_tsl}
-    else
-      {:error, :no_object_storage} -> {nil, nil, nil}
-      {:error, :not_found} -> {nil, nil, nil}
-      {:error, _reason} -> {nil, nil, nil}
+                Logger.info("Bedrock [#{cluster}]: Loaded cluster bootstrap from object storage (epoch: #{epoch})")
+                {:ok, {epoch, config, old_tsl}}
+
+              {:error, reason} ->
+                {:error, {:bootstrap_parse_failed, reason}}
+            end
+
+          {:error, :not_found} ->
+            admitted_first_boot_state(backend, cluster)
+
+          {:error, reason} ->
+            {:error, {:bootstrap_fetch_failed, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, {:object_storage_unavailable, reason}}
+    end
+  end
+
+  defp admitted_first_boot_state(backend, cluster) do
+    case ObjectStorage.first_boot_admission_status(backend, cluster.node_config()) do
+      {:ok, :admitted} ->
+        {:ok, {nil, nil, nil}}
+
+      {:error, reason} ->
+        {:error, {:bootstrap_missing_without_validated_first_boot_admission, reason}}
     end
   end
 
@@ -472,7 +496,10 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
         {:ok, data}
 
       {:error, :not_found} ->
-        Logger.info("Bedrock [#{cluster}]: No cluster bootstrap in object storage, starting fresh")
+        Logger.info(
+          "Bedrock [#{cluster}]: No cluster bootstrap in object storage; requiring validated first-boot admission"
+        )
+
         {:error, :not_found}
 
       {:error, reason} ->
@@ -491,6 +518,11 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
         Logger.warning("Bedrock [#{cluster}]: Failed to parse cluster bootstrap: #{inspect(reason)}")
         {:error, reason}
     end
+  rescue
+    error in [ArgumentError] ->
+      reason = {:malformed_bootstrap, Exception.message(error)}
+      Logger.warning("Bedrock [#{cluster}]: Failed to parse cluster bootstrap: #{inspect(reason)}")
+      {:error, reason}
   end
 
   # Build a Config struct from ClusterBootstrap data

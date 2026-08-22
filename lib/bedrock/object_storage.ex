@@ -169,6 +169,17 @@ defmodule Bedrock.ObjectStorage do
             ) :: :ok | error()
 
   @doc """
+  Validates that an absent cluster bootstrap may be treated as a pristine first boot.
+
+  This callback is intentionally optional. Backends that do not implement it are
+  not allowed to admit a first boot.
+  """
+  @callback first_boot_admission_status(backend :: term(), cluster_config :: keyword()) ::
+              {:ok, :admitted} | {:error, term()}
+
+  @optional_callbacks first_boot_admission_status: 2
+
+  @doc """
   Normalizes backend-specific error reasons to canonical ObjectStorage reasons.
 
   Canonical reasons:
@@ -195,6 +206,28 @@ defmodule Bedrock.ObjectStorage do
   def backend(module, config \\ []) when is_atom(module) do
     {module, config}
   end
+
+  @doc """
+  Asks a backend to validate a pristine first boot.
+
+  A backend must explicitly return `{:ok, :admitted}`. Missing validators,
+  rejected admissions, and malformed responses are returned as errors so a
+  coordinator cannot mistake them for an empty cluster.
+  """
+  @spec first_boot_admission_status(backend(), keyword()) :: {:ok, :admitted} | {:error, term()}
+  def first_boot_admission_status({module, config}, cluster_config) when is_atom(module) and is_list(cluster_config) do
+    if function_exported?(module, :first_boot_admission_status, 2) do
+      case module.first_boot_admission_status(config, cluster_config) do
+        {:ok, :admitted} = admitted -> admitted
+        {:error, _reason} = error -> error
+        other -> {:error, {:invalid_first_boot_admission_status, other}}
+      end
+    else
+      {:error, :first_boot_admission_validator_missing}
+    end
+  end
+
+  def first_boot_admission_status(_backend, _cluster_config), do: {:error, :invalid_first_boot_admission_backend}
 
   @doc """
   Store an object at the given key.

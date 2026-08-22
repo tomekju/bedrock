@@ -18,6 +18,7 @@ defmodule Bedrock.Service.Foreman.Supervisor do
 
     children = [
       {DynamicSupervisor, name: cluster.otp_name(:worker_supervisor)},
+      {Task.Supervisor, name: cluster.otp_name(:foreman_task_supervisor)},
       {Bedrock.Service.Foreman.Server,
        [
          cluster: cluster,

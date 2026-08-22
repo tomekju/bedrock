@@ -76,4 +76,20 @@ defmodule Bedrock.ControlPlane.Coordinator.StateTest do
       assert state.service_directory == %{}
     end
   end
+
+  describe "capability map" do
+    test "retains the current node when distribution is disabled" do
+      current_node = Node.self()
+
+      capability_map =
+        Changes.convert_to_capability_map(%{
+          current_node => [:coordination, :log, :materializer]
+        })
+
+      assert capability_map.coordination == [current_node]
+      assert capability_map.log == [current_node]
+      assert capability_map.materializer == [current_node]
+      assert capability_map.resolution == [current_node]
+    end
+  end
 end

@@ -10,6 +10,13 @@ defmodule Bedrock.ControlPlane.Director.State do
 
   @type state :: :starting | :recovery | :running | :stopped
   @type timer_registry :: %{atom() => reference()}
+  @type recovery_retry :: %{
+          epoch: Bedrock.epoch(),
+          stalled_attempt: non_neg_integer(),
+          retry_no: pos_integer(),
+          token: reference(),
+          timer_ref: reference() | nil
+        }
 
   @type t :: %__MODULE__{
           state: state(),
@@ -23,7 +30,8 @@ defmodule Bedrock.ControlPlane.Director.State do
           timers: timer_registry() | nil,
           services: %{Worker.id() => {atom(), {atom(), node()}}},
           lock_token: binary(),
-          recovery_attempt: Config.RecoveryAttempt.t() | nil
+          recovery_attempt: Config.RecoveryAttempt.t() | nil,
+          recovery_retry: recovery_retry() | nil
         }
   defstruct state: :starting,
             epoch: nil,
@@ -36,7 +44,8 @@ defmodule Bedrock.ControlPlane.Director.State do
             timers: nil,
             services: %{},
             lock_token: nil,
-            recovery_attempt: nil
+            recovery_attempt: nil,
+            recovery_retry: nil
 
   defmodule Changes do
     @moduledoc false

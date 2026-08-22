@@ -39,7 +39,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LockingPhase do
         {recovery_attempt, error}
 
       {:ok, locked_service_ids, log_recovery_info_by_id, materializer_recovery_info_by_id, transaction_services,
-       service_pids} ->
+       service_pids, transient_log_lock_timeout_ids} ->
         updated_recovery_attempt =
           recovery_attempt
           |> Map.update!(:log_recovery_info_by_id, &Map.merge(log_recovery_info_by_id, &1))
@@ -50,6 +50,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LockingPhase do
           |> Map.put(:locked_service_ids, locked_service_ids)
           |> Map.update!(:transaction_services, &Map.merge(transaction_services, &1))
           |> Map.update!(:service_pids, &Map.merge(service_pids, &1))
+          |> Map.put(:transient_log_lock_timeout_ids, transient_log_lock_timeout_ids)
 
         {updated_recovery_attempt, Bedrock.ControlPlane.Director.Recovery.LogRecoveryPlanningPhase}
     end
@@ -71,13 +72,15 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LockingPhase do
                kind: :log | :materializer,
                last_seen: {atom(), node()}
              }
-           }, service_pids :: %{Worker.id() => pid()}}
+           }, service_pids :: %{Worker.id() => pid()}, transient_log_lock_timeout_ids :: MapSet.t(Worker.id())}
           | {:error, :newer_epoch_exists}
-  def lock_old_system_services(old_system_services, epoch, context \\ %{}) do
-    timeout_in_ms = lock_old_system_services_timeout()
+  def lock_old_system_services(old_system_services, epoch, context) do
+    timeout_in_ms = Map.get(context, :lock_services_timeout_ms, lock_old_system_services_timeout())
+    task_supervisor = Map.fetch!(context, :recovery_task_supervisor)
 
-    old_system_services
-    |> Task.async_stream(
+    task_supervisor
+    |> Task.Supervisor.async_stream_nolink(
+      old_system_services,
       fn {id, service} ->
         {id, service, lock_service_for_recovery(service, epoch, context)}
       end,
@@ -86,11 +89,12 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LockingPhase do
       ordered: false,
       zip_input_on_exit: true
     )
-    |> Enum.reduce_while({MapSet.new(), %{}, %{}, %{}}, fn
+    |> Enum.reduce_while({MapSet.new(), %{}, %{}, %{}, MapSet.new()}, fn
       {:ok, {_, _, {:error, :newer_epoch_exists} = error}}, _ ->
         {:halt, error}
 
-      {:ok, {id, service, {:ok, pid, info}}}, {locked_ids, info_by_id, transaction_services, service_pids} ->
+      {:ok, {id, service, {:ok, pid, info}}},
+      {locked_ids, info_by_id, transaction_services, service_pids, timed_out_log_ids} ->
         {:cont,
          {MapSet.put(locked_ids, id), Map.put(info_by_id, id, info),
           Map.put(transaction_services, id, %{
@@ -101,16 +105,27 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LockingPhase do
                 {_kind, location} -> location
                 %{last_seen: location} -> location
               end
-          }), Map.put(service_pids, id, pid)}}
+          }), Map.put(service_pids, id, pid), timed_out_log_ids}}
+
+      {:ok, {id, {:log, _location}, {:error, :timeout}}},
+      {locked_ids, info_by_id, transaction_services, service_pids, timed_out_log_ids} ->
+        {:cont, {locked_ids, info_by_id, transaction_services, service_pids, MapSet.put(timed_out_log_ids, id)}}
 
       {:ok, {_id, _, {:error, _}}}, acc ->
+        {:cont, acc}
+
+      {:exit, {{id, {:log, _location}}, :timeout}},
+      {locked_ids, info_by_id, transaction_services, service_pids, timed_out_log_ids} ->
+        {:cont, {locked_ids, info_by_id, transaction_services, service_pids, MapSet.put(timed_out_log_ids, id)}}
+
+      {:exit, {_input, _reason}}, acc ->
         {:cont, acc}
     end)
     |> case do
       {:error, _reason} = error ->
         error
 
-      {locked_ids, info_by_id, transaction_services, service_pids} ->
+      {locked_ids, info_by_id, transaction_services, service_pids, timed_out_log_ids} ->
         grouped_recovery_info = Enum.group_by(info_by_id, &Map.get(elem(&1, 1), :kind))
         new_log_recovery_info_by_id = grouped_recovery_info |> Map.get(:log, []) |> Map.new()
 
@@ -118,7 +133,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LockingPhase do
           grouped_recovery_info |> Map.get(:materializer, []) |> Map.new()
 
         {:ok, locked_ids, new_log_recovery_info_by_id, new_materializer_recovery_info_by_id, transaction_services,
-         service_pids}
+         service_pids, timed_out_log_ids}
     end
   end
 

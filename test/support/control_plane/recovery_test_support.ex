@@ -3,7 +3,7 @@ defmodule Bedrock.Test.ControlPlane.RecoveryTestSupport do
   Shared test utilities and fixtures for recovery tests.
   """
 
-  import ExUnit.Callbacks, only: [on_exit: 1]
+  import ExUnit.Callbacks, only: [on_exit: 1, start_supervised!: 2]
 
   alias Bedrock.ControlPlane.Config.RecoveryAttempt
   alias Bedrock.DataPlane.Version
@@ -33,6 +33,11 @@ defmodule Bedrock.Test.ControlPlane.RecoveryTestSupport do
   Creates a basic test context with node capabilities and old transaction system layout.
   """
   def create_test_context(opts \\ []) do
+    recovery_task_supervisor =
+      Keyword.get_lazy(opts, :recovery_task_supervisor, fn ->
+        start_supervised!({Task.Supervisor, []}, id: {Task.Supervisor, make_ref()})
+      end)
+
     node_capabilities =
       Keyword.get(opts, :node_capabilities, %{
         log: [Node.self()],
@@ -65,6 +70,7 @@ defmodule Bedrock.Test.ControlPlane.RecoveryTestSupport do
       },
       available_services: %{},
       lock_token: "test_token",
+      recovery_task_supervisor: recovery_task_supervisor,
       coordinator: self()
     }
   end

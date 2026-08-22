@@ -3,6 +3,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhaseTest do
 
   import Bedrock.Test.ControlPlane.RecoveryTestSupport
 
+  alias Bedrock.ControlPlane.Director.Recovery
   alias Bedrock.ControlPlane.Director.Recovery.LogReplayPhase
   alias Bedrock.ControlPlane.Director.Recovery.SequencerStartupPhase
   alias Bedrock.DataPlane.Log
@@ -246,6 +247,55 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhaseTest do
   end
 
   describe "error handling scenarios" do
+    test "propagates a newer epoch from replay as a terminal recovery error" do
+      recovery_attempt =
+        recovery_attempt()
+        |> with_logs(%{"new-log" => []})
+        |> with_version_vector({Version.zero(), Version.zero()})
+        |> Map.put(:durable_version, Version.zero())
+        |> Map.put(:old_log_ids_to_copy, [])
+        |> Map.put(:service_pids, %{})
+
+      context = %{
+        copy_log_data_fn: fn _new_log_id, _survivors, _after, _last, _service_pids ->
+          {:error, :newer_epoch_exists}
+        end
+      }
+
+      assert {:error, :newer_epoch_exists} =
+               LogReplayPhase.replay_into_new_logs(
+                 [],
+                 ["new-log"],
+                 {Version.zero(), Version.zero()},
+                 recovery_attempt,
+                 context
+               )
+
+      assert {_, {:error, :newer_epoch_exists}} = LogReplayPhase.execute(recovery_attempt, context)
+
+      assert {{:error, :newer_epoch_exists}, _} =
+               Recovery.run_recovery_attempt(recovery_attempt, context, LogReplayPhase)
+    end
+
+    test "keeps ordinary replay failures stalled" do
+      recovery_attempt =
+        recovery_attempt()
+        |> with_logs(%{"new-log" => []})
+        |> with_version_vector({Version.zero(), Version.zero()})
+        |> Map.put(:durable_version, Version.zero())
+        |> Map.put(:old_log_ids_to_copy, [])
+        |> Map.put(:service_pids, %{})
+
+      context = %{
+        copy_log_data_fn: fn _new_log_id, _survivors, _after, _last, _service_pids ->
+          {:error, :timeout}
+        end
+      }
+
+      assert {_, {:stalled, {:failed_to_copy_some_logs, %{"new-log" => :timeout}}}} =
+               LogReplayPhase.execute(recovery_attempt, context)
+    end
+
     # Note: Tests that call Log.recover_from are complex to test without proper mocking
     # The core error handling logic is tested through the successful empty new_log_ids test
     # and the integration tests in execute/1

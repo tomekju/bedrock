@@ -61,6 +61,9 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhase do
         trace_recovery_old_logs_replayed()
         {recovery_attempt, Bedrock.ControlPlane.Director.Recovery.SequencerStartupPhase}
 
+      {:error, :newer_epoch_exists} = error ->
+        {recovery_attempt, error}
+
       {:error, reason} ->
         {recovery_attempt, {:stalled, reason}}
     end
@@ -83,6 +86,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhase do
           context :: map()
         ) ::
           :ok
+          | {:error, :newer_epoch_exists}
           | {:error, {:failed_to_copy_some_logs, %{Log.id() => term()}}}
   def replay_into_new_logs(
         survivor_log_ids,
@@ -123,6 +127,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhase do
         {:cont, Map.put(failures, log_id, reason)}
     end)
     |> case do
+      {:error, :newer_epoch_exists} = error -> error
       failures when failures == %{} -> :ok
       failures -> {:error, {:failed_to_copy_some_logs, failures}}
     end
@@ -137,6 +142,7 @@ defmodule Bedrock.ControlPlane.Director.Recovery.LogReplayPhase do
           context :: map()
         ) ::
           :ok
+          | {:error, :newer_epoch_exists}
           | {:error, {:failed_to_copy_some_logs, %{Log.id() => term()}}}
   def replay_old_logs_into_new_logs(old_log_ids, new_log_ids, version_vector, recovery_attempt, context \\ %{}) do
     replay_into_new_logs(old_log_ids, new_log_ids, version_vector, recovery_attempt, context)
