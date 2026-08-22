@@ -5,11 +5,24 @@ defmodule Bedrock.Internal.ClusterSupervisorTest do
   import Mox
 
   alias Bedrock.Cluster.Descriptor
+  alias Bedrock.Cluster.Link
+  alias Bedrock.ControlPlane.Coordinator.Server, as: CoordinatorServer
   alias Bedrock.Internal.ClusterSupervisor
+  alias Bedrock.ObjectStorage
+  alias Bedrock.ObjectStorage.LocalFilesystem
+  alias Bedrock.Service.Foreman.Supervisor, as: ForemanSupervisor
 
   setup :verify_on_exit!
 
   defmock(Bedrock.MockCluster, for: Bedrock.Cluster)
+
+  defmodule StartupOrderCluster do
+    @moduledoc false
+
+    use Bedrock.Cluster,
+      otp_app: :bedrock,
+      name: "cluster_supervisor_startup_order"
+  end
 
   # Test helpers
   defp expect_cluster_name(cluster, name) do
@@ -48,7 +61,6 @@ defmodule Bedrock.Internal.ClusterSupervisorTest do
       # Set up all the mock expectations needed for init
       expect(Bedrock.MockCluster, :otp_name, fn :sup -> :test_sup end)
       expect(Bedrock.MockCluster, :otp_name, fn :director_recovery_task_supervisor -> :test_recovery_task_sup end)
-      expect(Bedrock.MockCluster, :otp_name, fn :link -> :test_link end)
 
       assert_raise RuntimeError, "Unknown capability: :storage", fn ->
         # module_for_capability is private, so we test via init
@@ -69,6 +81,49 @@ defmodule Bedrock.Internal.ClusterSupervisorTest do
       # the capabilities are recognized by checking no "Unknown capability" error
       # This would need integration testing to fully verify
       assert [:coordination, :log, :materializer] == capabilities
+    end
+
+    @tag :tmp_dir
+    test "starts Coordinator and Foreman before the dependent Link", %{tmp_dir: tmp_dir} do
+      object_storage = ObjectStorage.backend(LocalFilesystem, root: Path.join(tmp_dir, "objects"))
+
+      config = [
+        capabilities: [:coordination, :log, :materializer],
+        desired_logs: 3,
+        desired_replication_factor: 3,
+        coordinator: [path: Path.join(tmp_dir, "coordinator"), persistent: true],
+        log: [path: Path.join(tmp_dir, "log"), object_storage: object_storage],
+        materializer: [path: Path.join(tmp_dir, "materializer"), object_storage: object_storage],
+        durability_mode: :strict
+      ]
+
+      descriptor = Descriptor.new(StartupOrderCluster.name(), [Node.self()])
+
+      assert {:ok, {_supervisor_flags, children}} =
+               ClusterSupervisor.init(
+                 {Node.self(), StartupOrderCluster, nil, config, Path.join(tmp_dir, "bedrock.cluster"), descriptor}
+               )
+
+      assert Enum.map(children, & &1.id) == [
+               StartupOrderCluster.otp_name(:sup),
+               StartupOrderCluster.otp_name(:director_recovery_task_supervisor),
+               CoordinatorServer,
+               ForemanSupervisor,
+               StartupOrderCluster.otp_name(:link)
+             ]
+
+      coordinator_child = Enum.find(children, &(&1.id == CoordinatorServer))
+      coordinator_name = StartupOrderCluster.otp_name(:coordinator)
+      current_node = Node.self()
+
+      assert {GenServer, :start_link,
+              [
+                CoordinatorServer,
+                {StartupOrderCluster, ^coordinator_name, [^current_node]},
+                [name: ^coordinator_name]
+              ]} = coordinator_child.start
+
+      assert List.last(children).start |> elem(2) |> hd() == Link.Server
     end
   end
 

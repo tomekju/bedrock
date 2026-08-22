@@ -192,6 +192,11 @@ defmodule Bedrock.DataPlane.Log.Shale.ServerTest do
       refute Process.alive?(demux)
       refute Process.alive?(shard_server)
 
+      assert {:error, :unavailable} =
+               GenServer.call(pid, {:get_shard_server, 777})
+
+      assert Process.alive?(pid)
+
       # A push while locked still appends to the WAL without crashing on
       # the missing demux
       encoded_bytes = TransactionTestSupport.new_log_transaction(1, %{"k" => "v"})

@@ -7,6 +7,9 @@ defmodule Bedrock.Cluster.Link.Discovery do
 
   alias Bedrock.Cluster.Link.State
   alias Bedrock.ControlPlane.Coordinator
+  alias Bedrock.Service.Foreman
+
+  @foreman_call_timeout_in_ms 1_000
 
   @doc """
   Find the leader coordinator. This implements enhanced two-phase discovery:
@@ -52,10 +55,15 @@ defmodule Bedrock.Cluster.Link.Discovery do
   defp handle_coordinator_discovery_result({:ok, {coordinator_ref, _epoch}}, t) do
     trace_found_coordinator(t.cluster, coordinator_ref)
 
-    t
-    |> cancel_timer(:find_a_live_coordinator)
-    |> change_coordinator(coordinator_ref)
-    |> then(&{&1, :ok})
+    t =
+      t
+      |> cancel_timer(:find_a_live_coordinator)
+      |> change_coordinator(coordinator_ref)
+
+    case t.known_coordinator do
+      :unavailable -> {t, {:error, :unavailable}}
+      _coordinator_ref -> {t, :ok}
+    end
   end
 
   defp handle_coordinator_discovery_result({:error, _reason} = error, t) do
@@ -153,14 +161,16 @@ defmodule Bedrock.Cluster.Link.Discovery do
 
   @spec change_coordinator(State.t(), {Coordinator.ref(), Bedrock.epoch()} | :unavailable) ::
           State.t()
+  def change_coordinator(t, :unavailable) do
+    %{t | known_coordinator: :unavailable, transaction_system_layout: nil}
+  end
+
   def change_coordinator(t, coordinator) when t.known_coordinator == coordinator, do: t
-  def change_coordinator(t, :unavailable), do: Map.put(t, :known_coordinator, :unavailable)
 
   @spec change_coordinator(State.t(), Coordinator.ref()) :: State.t()
   def change_coordinator(t, coordinator_ref) do
     t
     |> Map.put(:known_coordinator, coordinator_ref)
-    |> monitor_known_coordinator()
     |> register_node_capabilities()
   end
 
@@ -171,41 +181,60 @@ defmodule Bedrock.Cluster.Link.Discovery do
   end
 
   @spec register_node_capabilities(State.t()) :: State.t()
+  defp register_node_capabilities(%{capabilities: []} = t), do: monitor_known_coordinator(t)
+
   defp register_node_capabilities(t) do
     # Register node capabilities with the coordinator immediately upon connection.
     # This ensures the coordinator's node_capabilities map is populated before Director starts.
-    if t.capabilities != [] do
-      # CRITICAL: Also pull any already-running services from Foreman and register them atomically
-      # with capabilities. This prevents a race condition on successive boots where:
-      # 1. Services (e.g., storage workers) start and Foreman begins registering them
-      # 2. Link connects and registers empty capabilities
-      # 3. This triggers consensus, which completes immediately
-      # 4. Director starts with 0 services (before Foreman finishes registration)
-      # 5. Director fails with :unable_to_meet_log_quorum
-      #
-      # By pulling running services from Foreman here, we ensure Director sees all
-      # already-running services in its initial service directory.
-      compact_services = get_running_services_from_foreman(t)
-      Coordinator.register_node_resources(t.known_coordinator, self(), compact_services, t.capabilities)
+    # CRITICAL: Also pull any already-running services from Foreman and register them atomically
+    # with capabilities. This prevents a race condition on successive boots where:
+    # 1. Services (e.g., storage workers) start and Foreman begins registering them
+    # 2. Link connects and registers empty capabilities
+    # 3. This triggers consensus, which completes immediately
+    # 4. Director starts with 0 services (before Foreman finishes registration)
+    # 5. Director fails with :unable_to_meet_log_quorum
+    #
+    # The public Foreman call waits for its startup continuation to finish, so this
+    # pull is also the readiness barrier for restored workers. A typed failure must
+    # retry discovery rather than publishing an incomplete empty service set.
+    with {:ok, compact_services} <- get_running_services_from_foreman(t),
+         {:ok, _txn_id} <-
+           Coordinator.register_node_resources(
+             t.known_coordinator,
+             self(),
+             compact_services,
+             t.capabilities
+           ) do
+      monitor_known_coordinator(t)
+    else
+      {:error, _reason} -> schedule_registration_retry(t)
     end
-
-    t
   end
 
-  @spec get_running_services_from_foreman(State.t()) :: [Coordinator.compact_service_info()]
+  @spec get_running_services_from_foreman(State.t()) ::
+          {:ok, [Coordinator.compact_service_info()]}
+          | {:error, :unavailable | :timeout | :unknown}
   defp get_running_services_from_foreman(t) do
     # Only query Foreman if we have storage or log capabilities
     if :materializer in t.capabilities or :log in t.capabilities do
-      foreman_ref = t.cluster.otp_name(:foreman)
-
-      case GenServer.call(foreman_ref, :get_all_running_services, 1000) do
-        {:ok, services} when is_list(services) -> services
-        _ -> []
+      :foreman
+      |> t.cluster.otp_name()
+      |> Foreman.get_all_running_services(timeout: @foreman_call_timeout_in_ms)
+      |> case do
+        {:ok, services} when is_list(services) -> {:ok, services}
+        {:error, _reason} = error -> error
+        _other -> {:error, :unknown}
       end
     else
-      []
+      {:ok, []}
     end
-  rescue
-    _ -> []
+  end
+
+  @spec schedule_registration_retry(State.t()) :: State.t()
+  defp schedule_registration_retry(t) do
+    t
+    |> change_coordinator(:unavailable)
+    |> cancel_timer(:find_a_live_coordinator)
+    |> set_timer(:find_a_live_coordinator, t.cluster.gateway_ping_timeout_in_ms())
   end
 end

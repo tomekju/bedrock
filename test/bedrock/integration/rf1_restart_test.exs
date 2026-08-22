@@ -55,7 +55,7 @@ defmodule Bedrock.Integration.RF1RestartTest do
              )
 
     assert {:ok, _bootstrap} = ObjectStorage.get(config[:object_storage], "bootstrap")
-    assert 1 = Agent.get(first_boot_admission_tracker, & &1)
+    assert 2 = Agent.get(first_boot_admission_tracker, & &1)
 
     stop_cluster!(first_cluster)
 
@@ -71,7 +71,7 @@ defmodule Bedrock.Integration.RF1RestartTest do
                retry_limit: 5
              )
 
-    assert 1 = Agent.get(first_boot_admission_tracker, & &1)
+    assert 2 = Agent.get(first_boot_admission_tracker, & &1)
 
     stop_cluster!(second_cluster)
   end

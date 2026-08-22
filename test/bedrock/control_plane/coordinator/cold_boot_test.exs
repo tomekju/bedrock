@@ -19,7 +19,7 @@ defmodule Bedrock.ControlPlane.Coordinator.ColdBootTest do
   end
 
   describe "cold boot leadership election" do
-    test "leader election completes when there are no transactions to reach consensus on" do
+    test "leader election fails closed without durable bootstrap access" do
       # Simulate a fresh coordinator state with an empty Raft log
       my_node = Node.self()
       raft_log = InMemoryLog.new(:tuple)
@@ -56,22 +56,16 @@ defmodule Bedrock.ControlPlane.Coordinator.ColdBootTest do
       # Simulate leadership election - this node becomes leader
       leadership_event = {:raft, :leadership_changed, {my_node, 1}}
 
-      # Upon leadership election, the coordinator should immediately proceed to director startup
-      # (no waiting for consensus - TSL is output of recovery, config loaded from object storage at init)
+      assert {:stop, {:leadership_bootstrap_reload_failed, {:object_storage_unavailable, :no_object_storage}},
+              updated_state} =
+               Server.handle_info(leadership_event, state)
 
-      # The director startup will fail because there's no supervisor in the test environment,
-      # but we can verify that it ATTEMPTED to start the director
-      result = catch_exit(Server.handle_info(leadership_event, state))
-
-      # Verify it attempted director startup - the exit indicates it tried to call the supervisor
-      assert match?({:noproc, _}, result) or match?({:EXIT, :noproc}, result) or match?({:normal, _}, result),
-             "Expected director startup attempt, got: #{inspect(result)}"
+      assert updated_state.leader_startup_state == :recovery_failed
+      assert updated_state.director == :unavailable
+      assert updated_state.transaction_system_layout == nil
     end
 
-    test "leader election with existing committed transactions starts director immediately" do
-      # With the new flow, the coordinator starts the director immediately on leadership
-      # election - it no longer waits for consensus first
-
+    test "committed Raft transactions do not bypass durable bootstrap admission" do
       my_node = Node.self()
       raft_log = InMemoryLog.new(:tuple)
 
@@ -112,11 +106,13 @@ defmodule Bedrock.ControlPlane.Coordinator.ColdBootTest do
       # Simulate leadership election
       leadership_event = {:raft, :leadership_changed, {my_node, 1}}
 
-      # Director startup will fail because no supervisor, but verify it attempted to start
-      result = catch_exit(Server.handle_info(leadership_event, state))
+      assert {:stop, {:leadership_bootstrap_reload_failed, {:object_storage_unavailable, :no_object_storage}},
+              updated_state} =
+               Server.handle_info(leadership_event, state)
 
-      assert match?({:noproc, _}, result) or match?({:EXIT, :noproc}, result) or match?({:normal, _}, result),
-             "Expected director startup attempt, got: #{inspect(result)}"
+      assert updated_state.leader_startup_state == :recovery_failed
+      assert updated_state.director == :unavailable
+      assert updated_state.transaction_system_layout == nil
     end
   end
 

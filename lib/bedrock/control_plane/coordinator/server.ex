@@ -22,6 +22,7 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
       put_leader_startup_state: 2,
       put_config: 2,
       put_transaction_system_layout: 2,
+      clear_transaction_system_layout: 1,
       update_raft: 2,
       add_tsl_subscriber: 2,
       replay_tsl_to: 2,
@@ -62,10 +63,18 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
   # Suppress the false positive since defensive error handling is appropriate here.
   @dialyzer {:no_match, parse_bootstrap_data: 2}
 
-  @spec child_spec(opts :: [cluster: module()]) :: Supervisor.child_spec()
+  @spec child_spec(opts :: [cluster: module(), coordinator_nodes: [node()]]) :: Supervisor.child_spec()
   def child_spec(opts) do
     cluster = opts[:cluster] || raise "Missing :cluster option"
     otp_name = cluster.otp_name(:coordinator)
+    coordinator_nodes = opts[:coordinator_nodes]
+
+    init_arg =
+      if is_list(coordinator_nodes) do
+        {cluster, otp_name, coordinator_nodes}
+      else
+        {cluster, otp_name}
+      end
 
     %{
       id: __MODULE__,
@@ -73,7 +82,7 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
         {GenServer, :start_link,
          [
            __MODULE__,
-           {cluster, otp_name},
+           init_arg,
            [name: otp_name]
          ]},
       restart: :permanent
@@ -81,15 +90,18 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
   end
 
   @impl true
-  def init({cluster, otp_name}) do
+  def init({cluster, otp_name}), do: init({cluster, otp_name, nil})
+
+  def init({cluster, otp_name, injected_coordinator_nodes}) do
     trace_started(cluster, otp_name)
 
     my_node = Node.self()
 
-    with {:ok, coordinator_nodes} <- cluster.fetch_coordinator_nodes(),
+    with {:ok, coordinator_nodes} <- coordinator_nodes(cluster, injected_coordinator_nodes),
          true <- my_node in coordinator_nodes || {:error, :not_a_coordinator},
          {:ok, raft_log} <- init_raft_log(cluster),
-         {:ok, {loaded_epoch, loaded_config, loaded_tsl}} <- load_state_from_object_storage(cluster) do
+         {:ok, {loaded_epoch, loaded_config, loaded_tsl}} <-
+           load_state_from_object_storage(cluster, coordinator_nodes) do
       # The only nil config is a backend-admitted pristine first boot.
 
       {:ok,
@@ -97,6 +109,7 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
          cluster: cluster,
          my_node: my_node,
          otp_name: otp_name,
+         coordinator_nodes: coordinator_nodes,
          supervisor_otp_name: cluster.otp_name(:sup),
          epoch: loaded_epoch,
          config: loaded_config,
@@ -117,6 +130,10 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
       {:error, reason} -> {:stop, {:bootstrap_load_failed, reason}}
     end
   end
+
+  defp coordinator_nodes(_cluster, coordinator_nodes) when is_list(coordinator_nodes), do: {:ok, coordinator_nodes}
+
+  defp coordinator_nodes(cluster, nil), do: cluster.fetch_coordinator_nodes()
 
   @impl true
   def handle_continue(:check_recovery_consensus, t) do
@@ -225,30 +242,44 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
   def handle_info({:raft, :leadership_changed, {new_leader, raft_epoch}}, t) do
     trace_election_completed(new_leader)
 
-    updated_t =
+    elected_t =
       t
       |> put_leader_node(new_leader)
       |> put_epoch(raft_epoch)
 
-    if_result =
-      if new_leader == t.my_node do
-        # We became leader - start Director immediately
-        # TSL is OUTPUT of recovery (not input), config is loaded from object storage at init
-        service_count = map_size(updated_t.service_directory)
-        trace_leader_ready_starting_director(service_count)
+    if new_leader == t.my_node do
+      # A coordinator can have started before the bootstrap was written by
+      # the previous leader. Reload it now so recovery never mistakes an
+      # existing cluster for a fresh one after leadership changes.
+      case reload_leadership_recovery_input(t, raft_epoch) do
+        {:ok, reloaded_t} ->
+          service_count = map_size(reloaded_t.service_directory)
+          trace_leader_ready_starting_director(service_count)
 
-        updated_t
-        |> put_leader_startup_state(:leader_ready)
-        |> update_recovery_capability_hash()
-        |> attempt_director_recovery(:leadership_change)
-      else
-        # Someone else is leader - clean up director if we have one
-        updated_t
-        |> put_leader_startup_state(:not_leader)
-        |> cleanup_director_on_leadership_loss()
+          reloaded_t
+          |> put_leader_node(new_leader)
+          |> put_leader_startup_state(:leader_ready)
+          |> update_recovery_capability_hash()
+          |> attempt_director_recovery(:leadership_change)
+          |> noreply()
+
+        {:error, reason} ->
+          Logger.error(
+            "Bedrock [#{t.cluster}]: Refusing leader recovery because bootstrap reload failed: #{inspect(reason)}"
+          )
+
+          elected_t
+          |> put_leader_startup_state(:recovery_failed)
+          |> clear_transaction_system_layout()
+          |> stop({:leadership_bootstrap_reload_failed, reason})
       end
-
-    noreply(if_result)
+    else
+      # Someone else is leader - clean up director if we have one
+      elected_t
+      |> put_leader_startup_state(:not_leader)
+      |> cleanup_director_on_leadership_loss()
+      |> noreply()
+    end
   end
 
   def handle_info({:raft, :timer, event}, t) do
@@ -275,9 +306,18 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
     |> noreply()
   end
 
-  def handle_info({:DOWN, _monitor_ref, :process, pid, reason}, t) do
+  def handle_info(
+        {:DOWN, _monitor_ref, :process, director, reason},
+        %{director: director, leader_node: leader_node, my_node: leader_node} = t
+      ) do
     t
-    |> handle_director_failure(pid, reason)
+    |> handle_director_failure(director, reason)
+    |> remove_tsl_subscriber(director)
+    |> stop({:shutdown, {:director_failed, director, reason}})
+  end
+
+  def handle_info({:DOWN, _monitor_ref, :process, pid, _reason}, t) do
+    t
     |> remove_tsl_subscriber(pid)
     |> noreply()
   end
@@ -448,9 +488,74 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
 
   # Object Storage loading functions
 
-  @spec load_state_from_object_storage(module()) ::
+  @spec load_state_from_object_storage(module(), [node()]) ::
           {:ok, {Bedrock.epoch() | nil, map() | nil, map() | nil}} | {:error, term()}
-  defp load_state_from_object_storage(cluster) do
+  defp load_state_from_object_storage(cluster, coordinator_nodes) do
+    case load_existing_bootstrap_state(cluster, coordinator_nodes) do
+      {:ok, _state} = loaded ->
+        loaded
+
+      {:error, :bootstrap_missing} ->
+        case get_object_storage_backend(cluster) do
+          {:ok, backend} -> admitted_first_boot_state(backend, cluster)
+          {:error, reason} -> {:error, {:object_storage_unavailable, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @spec reload_leadership_recovery_input(State.t(), Bedrock.epoch()) ::
+          {:ok, State.t()} | {:error, term()}
+  defp reload_leadership_recovery_input(t, raft_epoch) do
+    loader =
+      if pristine_initial_leadership?(t) do
+        # init/1 validated first boot already. Revalidating protects the
+        # interval before the first bootstrap exists: a namespace that became
+        # initialized elsewhere must not be recovered as a new cluster here.
+        &load_state_from_object_storage(&1, t.coordinator_nodes)
+      else
+        # Once this coordinator has observed any election or recovery input,
+        # a missing bootstrap is data loss, never permission for a fresh run.
+        &load_existing_bootstrap_state(&1, t.coordinator_nodes)
+      end
+
+    with {:ok, {bootstrap_epoch, config, old_tsl}} <- loader.(t.cluster),
+         :ok <- validate_bootstrap_epoch(bootstrap_epoch, raft_epoch) do
+      {:ok,
+       %{
+         t
+         | epoch: raft_epoch,
+           config: config,
+           old_transaction_system_layout: old_tsl
+       }}
+    end
+  end
+
+  defp pristine_initial_leadership?(%{
+         epoch: nil,
+         config: nil,
+         old_transaction_system_layout: nil,
+         transaction_system_layout: nil
+       }), do: true
+
+  defp pristine_initial_leadership?(_t), do: false
+
+  defp validate_bootstrap_epoch(nil, _raft_epoch), do: :ok
+
+  defp validate_bootstrap_epoch(bootstrap_epoch, raft_epoch)
+       when is_integer(bootstrap_epoch) and bootstrap_epoch <= raft_epoch, do: :ok
+
+  defp validate_bootstrap_epoch(bootstrap_epoch, raft_epoch) when is_integer(bootstrap_epoch) do
+    {:error, {:bootstrap_epoch_ahead_of_raft, bootstrap_epoch, raft_epoch}}
+  end
+
+  defp validate_bootstrap_epoch(bootstrap_epoch, _raft_epoch), do: {:error, {:invalid_bootstrap_epoch, bootstrap_epoch}}
+
+  @spec load_existing_bootstrap_state(module(), [node()]) ::
+          {:ok, {Bedrock.epoch(), map(), map()}} | {:error, term()}
+  defp load_existing_bootstrap_state(cluster, coordinator_nodes) do
     case get_object_storage_backend(cluster) do
       {:ok, backend} ->
         case fetch_bootstrap_data(backend, cluster) do
@@ -458,10 +563,11 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
             case parse_bootstrap_data(data, cluster) do
               {:ok, bootstrap} ->
                 epoch = bootstrap.epoch
-                config = build_config_from_bootstrap(bootstrap, cluster)
+                config = build_config_from_bootstrap(bootstrap, coordinator_nodes)
                 old_tsl = build_old_tsl_from_bootstrap(bootstrap)
 
                 Logger.info("Bedrock [#{cluster}]: Loaded cluster bootstrap from object storage (epoch: #{epoch})")
+
                 {:ok, {epoch, config, old_tsl}}
 
               {:error, reason} ->
@@ -469,7 +575,7 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
             end
 
           {:error, :not_found} ->
-            admitted_first_boot_state(backend, cluster)
+            {:error, :bootstrap_missing}
 
           {:error, reason} ->
             {:error, {:bootstrap_fetch_failed, reason}}
@@ -526,9 +632,7 @@ defmodule Bedrock.ControlPlane.Coordinator.Server do
   end
 
   # Build a Config struct from ClusterBootstrap data
-  defp build_config_from_bootstrap(bootstrap, cluster) do
-    {:ok, coordinator_nodes} = cluster.fetch_coordinator_nodes()
-
+  defp build_config_from_bootstrap(bootstrap, coordinator_nodes) do
     %{
       coordinators: coordinator_nodes,
       parameters: build_parameters(bootstrap[:parameters], coordinator_nodes),

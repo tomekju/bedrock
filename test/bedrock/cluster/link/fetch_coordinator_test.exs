@@ -29,4 +29,25 @@ defmodule Bedrock.Cluster.Link.FetchCoordinatorTest do
                Server.handle_call(:get_known_coordinator, self(), state)
     end
   end
+
+  test "Coordinator failure clears the cached runnable layout before discovery" do
+    coordinator = start_supervised!({Agent, fn -> nil end})
+
+    state = %State{
+      node: Node.self(),
+      cluster: DefaultTestCluster,
+      known_coordinator: coordinator,
+      transaction_system_layout: %{id: "stale-layout"}
+    }
+
+    assert {:noreply,
+            %State{
+              known_coordinator: :unavailable,
+              transaction_system_layout: nil
+            }, {:continue, :find_a_live_coordinator}} =
+             Server.handle_info(
+               {:DOWN, make_ref(), :process, coordinator, :coordinator_restarted},
+               state
+             )
+  end
 end

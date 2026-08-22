@@ -137,7 +137,7 @@ defmodule Bedrock.ControlPlane.Coordinator.DurabilityTest do
       assert_received {:"$gen_cast", {:capabilities_updated, %{coordination: [], resolution: []}}}
     end
 
-    test "notifies the director only about services whose kind or worker ref changed" do
+    test "notifies the director about changed services and the node liveness refresh" do
       initial_state =
         state(
           director: self(),
@@ -162,10 +162,10 @@ defmodule Bedrock.ControlPlane.Coordinator.DurabilityTest do
       Durability.process_command(initial_state, command)
 
       assert_received {:"$gen_cast", {:service_registered, [{"moved", :storage, {:storage_worker_2, :node1@host}}]}}
-      refute_received {:"$gen_cast", {:capabilities_updated, _}}
+      assert_received {:"$gen_cast", {:capabilities_updated, %{log: [], resolution: []}}}
     end
 
-    test "does not notify the director when services and capabilities are unchanged" do
+    test "unchanged Link registration refreshes liveness without duplicating services" do
       initial_state =
         state(
           director: self(),
@@ -185,7 +185,8 @@ defmodule Bedrock.ControlPlane.Coordinator.DurabilityTest do
 
       assert updated_state.service_directory == initial_state.service_directory
       assert updated_state.node_capabilities == initial_state.node_capabilities
-      refute_received {:"$gen_cast", _}
+      refute_received {:"$gen_cast", {:service_registered, _}}
+      assert_received {:"$gen_cast", {:capabilities_updated, %{log: [], resolution: []}}}
     end
 
     test "does not notify anyone when the director is unavailable" do

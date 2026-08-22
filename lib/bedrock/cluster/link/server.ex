@@ -121,6 +121,8 @@ defmodule Bedrock.Cluster.Link.Server do
   def handle_info({:timeout, :find_a_live_coordinator}, t), do: noreply(t, continue: :find_a_live_coordinator)
 
   @spec handle_info({:tsl_updated, term()}, State.t()) :: {:noreply, State.t()}
+  def handle_info({:tsl_updated, _new_tsl}, %{known_coordinator: :unavailable} = t), do: noreply(t)
+
   def handle_info({:tsl_updated, new_tsl}, t) do
     # Update cached TSL when coordinator broadcasts updates, and forward to
     # this node's foreman (if any): a newly durable layout is the trigger

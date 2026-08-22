@@ -142,18 +142,20 @@ defmodule Bedrock.Internal.ClusterSupervisor do
     children =
       [
         {DynamicSupervisor, name: cluster.otp_name(:sup)},
-        {Task.Supervisor, name: cluster.otp_name(:director_recovery_task_supervisor)},
-        {Link,
-         [
-           cluster: cluster,
-           descriptor: descriptor,
-           path_to_descriptor: path_to_descriptor,
-           otp_name: cluster.otp_name(:link),
-           capabilities: capabilities,
-           mode: mode_for_capabilities(capabilities)
-         ]}
-        | children_for_capabilities(cluster, capabilities, config)
-      ]
+        {Task.Supervisor, name: cluster.otp_name(:director_recovery_task_supervisor)}
+      ] ++
+        children_for_capabilities(cluster, capabilities, config, descriptor) ++
+        [
+          {Link,
+           [
+             cluster: cluster,
+             descriptor: descriptor,
+             path_to_descriptor: path_to_descriptor,
+             otp_name: cluster.otp_name(:link),
+             capabilities: capabilities,
+             mode: mode_for_capabilities(capabilities)
+           ]}
+        ]
 
     Supervisor.init(children, strategy: :one_for_one)
   end
@@ -189,17 +191,18 @@ defmodule Bedrock.Internal.ClusterSupervisor do
     end
   end
 
-  defp children_for_capabilities(_cluster, [], _config), do: []
+  defp children_for_capabilities(_cluster, [], _config, _descriptor), do: []
 
-  defp children_for_capabilities(cluster, capabilities, config) do
-    capabilities
-    |> Enum.map(&{module_for_capability(&1), &1})
-    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
-    |> Enum.map(fn {module, capabilities} ->
+  defp children_for_capabilities(cluster, capabilities, config, descriptor) do
+    grouped_capabilities = Enum.group_by(capabilities, &module_for_capability/1)
+
+    for module <- [Coordinator, Foreman],
+        module_capabilities = Map.get(grouped_capabilities, module, []),
+        module_capabilities != [] do
       # For modules that serve multiple capabilities (like Foreman),
       # we need to find a common config that works for all capabilities
       capability_configs =
-        capabilities
+        module_capabilities
         |> Enum.map(fn capability ->
           Keyword.get(config, capability, [])
         end)
@@ -221,12 +224,21 @@ defmodule Bedrock.Internal.ClusterSupervisor do
           merged_config
         end
 
-      {module,
-       [
-         cluster: cluster,
-         capabilities: capabilities
-       ] ++ merged_config}
-    end)
+      child_opts =
+        [
+          cluster: cluster,
+          capabilities: module_capabilities
+        ] ++ merged_config
+
+      child_opts =
+        if module == Coordinator do
+          Keyword.put(child_opts, :coordinator_nodes, descriptor.coordinator_nodes)
+        else
+          child_opts
+        end
+
+      {module, child_opts}
+    end
   end
 
   defp ensure_object_storage(config) do

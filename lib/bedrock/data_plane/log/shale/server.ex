@@ -285,6 +285,8 @@ defmodule Bedrock.DataPlane.Log.Shale.Server do
   def handle_call(:ping, _from, t), do: reply(t, :pong)
 
   @impl true
+  def handle_call({:get_shard_server, _shard_id}, _from, %{demux: nil} = t), do: reply(t, {:error, :unavailable})
+
   def handle_call({:get_shard_server, shard_id}, _from, t) do
     result = Demux.Server.get_shard_server(t.demux, shard_id)
     reply(t, result)

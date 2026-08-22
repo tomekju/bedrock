@@ -274,7 +274,6 @@ defmodule Bedrock.Service.Foreman.Impl do
       |> Map.values()
       |> Enum.filter(&(&1.health == :stopped))
       |> try_to_start_workers(t.cluster, t.object_storage)
-      |> advertise_running_workers(t.cluster)
       |> merge_worker_info_into_workers(workers)
     end)
   end

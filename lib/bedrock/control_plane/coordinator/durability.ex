@@ -78,9 +78,6 @@ defmodule Bedrock.ControlPlane.Coordinator.Durability do
         end
       end)
 
-    current_capabilities = Map.get(t.node_capabilities, node, [])
-    capabilities_changed = current_capabilities != capabilities
-
     updated_state =
       t
       |> update_service_directory(fn directory ->
@@ -94,11 +91,16 @@ defmodule Bedrock.ControlPlane.Coordinator.Durability do
       end)
       |> update_node_capabilities(node, capabilities)
 
+    # `set_node_resources` is an atomic Link-session registration as well as
+    # a descriptor update. A restarted node can present byte-identical service
+    # identities and capabilities, so always refresh the Director's live
+    # capability view. Running Directors ignore the retry signal; a stalled
+    # Director uses it to resume recovery after the node rejoins.
     notify_director_of_resource_changes(
       updated_state.director,
       new_or_changed_services,
       updated_state.node_capabilities,
-      capabilities_changed
+      true
     )
 
     updated_state

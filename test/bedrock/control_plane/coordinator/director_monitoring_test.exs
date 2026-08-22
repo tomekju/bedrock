@@ -4,6 +4,7 @@ defmodule Bedrock.ControlPlane.Coordinator.DirectorMonitoringTest do
   import ExUnit.CaptureLog
 
   alias Bedrock.ControlPlane.Coordinator.DirectorManagement
+  alias Bedrock.ControlPlane.Coordinator.Server
   alias Bedrock.ControlPlane.Coordinator.State
 
   defmodule ConfiguredCluster do
@@ -60,6 +61,49 @@ defmodule Bedrock.ControlPlane.Coordinator.DirectorMonitoringTest do
         end)
 
       assert log_output =~ "Director #{inspect(director_pid)} failed with reason: :test_reason"
+    end
+
+    test "current Director failure stops the leader Coordinator for a higher Raft epoch" do
+      director_pid = create_director_pid()
+
+      state = %{
+        leader_state(director_pid)
+        | leader_startup_state: :leader_ready,
+          transaction_system_layout: %{id: "stale-layout"},
+          tsl_subscribers: MapSet.new([self()])
+      }
+
+      assert {:stop, {:shutdown, {:director_failed, ^director_pid, :component_down}}, updated_state} =
+               Server.handle_info(
+                 {:DOWN, make_ref(), :process, director_pid, :component_down},
+                 state
+               )
+
+      assert updated_state.director == :unavailable
+      assert updated_state.leader_startup_state == :recovery_failed
+      assert updated_state.transaction_system_layout == nil
+      assert_received {:tsl_updated, nil}
+    end
+
+    test "subscriber failure does not stop the Coordinator" do
+      director_pid = create_director_pid()
+      subscriber = spawn(fn -> :ok end)
+
+      state = %{
+        leader_state(director_pid)
+        | transaction_system_layout: %{id: "current-layout"},
+          tsl_subscribers: MapSet.new([subscriber])
+      }
+
+      assert {:noreply, updated_state} =
+               Server.handle_info(
+                 {:DOWN, make_ref(), :process, subscriber, :normal},
+                 state
+               )
+
+      assert updated_state.director == director_pid
+      assert updated_state.transaction_system_layout == %{id: "current-layout"}
+      refute MapSet.member?(updated_state.tsl_subscribers, subscriber)
     end
 
     test "handle_director_failure ignores failure from different director" do

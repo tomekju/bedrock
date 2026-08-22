@@ -14,6 +14,7 @@ defmodule Bedrock.ControlPlane.Coordinator.State do
 
   @type t :: %__MODULE__{
           cluster: module(),
+          coordinator_nodes: [node()],
           leader_node: node() | :undecided,
           my_node: node(),
           epoch: Bedrock.epoch(),
@@ -34,6 +35,7 @@ defmodule Bedrock.ControlPlane.Coordinator.State do
           recovery_tracker: RecoveryCapabilityTracker.t()
         }
   defstruct cluster: nil,
+            coordinator_nodes: [],
             leader_node: :undecided,
             my_node: nil,
             epoch: nil,

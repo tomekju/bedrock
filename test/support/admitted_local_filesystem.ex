@@ -31,10 +31,24 @@ defmodule Bedrock.Test.AdmittedLocalFilesystem do
   @impl true
   def first_boot_admission_status(config, _cluster_config) do
     tracker = Keyword.fetch!(config, :first_boot_admission_tracker)
+    root = Keyword.fetch!(config, :root)
 
-    Agent.get_and_update(tracker, fn
-      0 -> {{:ok, :admitted}, 1}
-      attempts -> {{:error, :unexpected_first_boot_admission}, attempts + 1}
-    end)
+    keys =
+      if File.dir?(root) do
+        config
+        |> LocalFilesystem.list("", limit: 2)
+        |> Enum.take(2)
+      else
+        []
+      end
+
+    case keys do
+      [] ->
+        Agent.update(tracker, &(&1 + 1))
+        {:ok, :admitted}
+
+      keys ->
+        {:error, {:first_boot_namespace_not_pristine, keys}}
+    end
   end
 end
