@@ -84,15 +84,14 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.CompactionWriterTest do
       assert result.idx_path == idx_path
       assert result.data_offset == byte_size("data content")
       assert result.idx_offset == byte_size("index content")
+      refute Map.has_key?(result, :data_fd)
+      refute Map.has_key?(result, :idx_fd)
 
       # Verify files have content
       {:ok, data_content} = File.read(to_string(data_path))
       {:ok, idx_content} = File.read(to_string(idx_path))
       assert data_content == "data content"
       assert idx_content == "index content"
-
-      :file.close(result.data_fd)
-      :file.close(result.idx_fd)
     end
 
     test "write_data/2 handles iodata (lists)", %{tmp_dir: tmp_dir} do
@@ -110,9 +109,36 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.CompactionWriterTest do
 
       {:ok, content} = File.read(to_string(data_path))
       assert content == "hello world"
+      refute Map.has_key?(result, :data_fd)
+    end
 
-      :file.close(result.data_fd)
-      :file.close(result.idx_fd)
+    test "finish/1 closes descriptors so the caller can reopen the files", %{tmp_dir: tmp_dir} do
+      data_path = String.to_charlist(Path.join(tmp_dir, "data"))
+      idx_path = String.to_charlist(Path.join(tmp_dir, "idx"))
+      parent = self()
+
+      {:ok, writer_pid} =
+        Task.start_link(fn ->
+          {:ok, writer} = SplitFile.new(data_path, idx_path)
+          {:ok, writer} = SplitFile.write_data(writer, "owned-by-writer")
+          {:ok, writer} = SplitFile.write_index(writer, "idx-owned-by-writer")
+          {:ok, result} = SplitFile.finish(writer)
+          send(parent, {:finished, self(), result})
+        end)
+
+      assert_receive {:finished, ^writer_pid, result}, 5_000
+      assert result.data_offset == byte_size("owned-by-writer")
+
+      {:ok, data_fd} = :file.open(data_path, [:raw, :binary, :read, :write])
+      {:ok, idx_fd} = :file.open(idx_path, [:raw, :binary, :read, :write])
+      assert :ok = :file.sync(data_fd)
+      assert :ok = :file.sync(idx_fd)
+      {:ok, data_size} = :file.position(data_fd, {:eof, 0})
+      {:ok, idx_size} = :file.position(idx_fd, {:eof, 0})
+      assert data_size == byte_size("owned-by-writer")
+      assert idx_size == byte_size("idx-owned-by-writer")
+      :ok = :file.close(data_fd)
+      :ok = :file.close(idx_fd)
     end
   end
 

@@ -261,6 +261,20 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Index do
     {new_map, final_needed}
   end
 
+  @doc """
+  Build an index, id-allocator inputs, and key count from a complete page map.
+
+  Used by recovery and compaction cutover so free IDs and `n_keys` match the
+  durable pages rather than a newer in-memory manager.
+  """
+  @spec build_from_page_map(%{Page.id() => {Page.t(), Page.id()}}, keyword()) ::
+          {:ok, t(), Page.id(), [Page.id()], non_neg_integer()}
+  def build_from_page_map(page_map, opts \\ []) when is_map(page_map) do
+    max_keys = Keyword.get(opts, :max_keys_per_page, @default_max_keys_per_page)
+    target_keys = Keyword.get(opts, :target_keys_per_page, div(max_keys * 9, 10))
+    build_index_from_page_map(page_map, max_keys, target_keys)
+  end
+
   @spec build_index_from_page_map(%{Page.id() => {Page.t(), Page.id()}}, pos_integer(), pos_integer()) ::
           {:ok, t(), Page.id(), [Page.id()], non_neg_integer()}
   defp build_index_from_page_map(page_map, max_keys_per_page, target_keys_per_page) do

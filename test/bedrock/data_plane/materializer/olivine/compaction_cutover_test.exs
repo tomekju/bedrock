@@ -151,7 +151,7 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.CompactionCutoverTest do
     state = :sys.get_state(pid)
     {:ok, task} = Logic.start_compaction(state)
 
-    assert_receive {:compaction_ready, _, _, _, _, _, _, _, durable_version, _, _, _} = cutover_msg,
+    assert_receive {:compaction_ready, _, _, _, _, _, durable_version, _, _, _} = cutover_msg,
                    10_000
 
     Task.await(task)

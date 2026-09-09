@@ -5,10 +5,8 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
   import Bedrock.Internal.GenServer.Replies
 
   alias Bedrock.DataPlane.Materializer
-  alias Bedrock.DataPlane.Materializer.Olivine.DataDatabase
-  alias Bedrock.DataPlane.Materializer.Olivine.Index
+  alias Bedrock.DataPlane.Materializer.Olivine.Database
   alias Bedrock.DataPlane.Materializer.Olivine.Index.Page
-  alias Bedrock.DataPlane.Materializer.Olivine.IndexDatabase
   alias Bedrock.DataPlane.Materializer.Olivine.IndexManager
   alias Bedrock.DataPlane.Materializer.Olivine.IntakeQueue
   alias Bedrock.DataPlane.Materializer.Olivine.Logic
@@ -177,9 +175,13 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
 
   @impl true
   def handle_call(:compact, _from, %State{} = t) do
-    {:ok, task} = Logic.start_compaction(t)
-    updated_state = %{t | compaction_task: task, allow_window_advancement: false}
-    reply(updated_state, :ok)
+    case Logic.start_compaction(t) do
+      {:ok, task} ->
+        reply(%{t | compaction_task: task, allow_window_advancement: false}, :ok)
+
+      {:error, reason} ->
+        reply(t, {:error, reason})
+    end
   end
 
   @impl true
@@ -326,147 +328,67 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
 
   @impl true
   def handle_info(
-        {:compaction_ready, compact_data_fd, compact_idx_fd, compact_data_path, compact_idx_path, new_data_offset,
-         index_offset, compacted_pages, durable_version, duration, data_size_before, index_size_before},
+        {:compaction_ready, compact_data_path, compact_idx_path, new_data_offset, index_offset, compacted_pages,
+         durable_version, duration, data_size_before, index_size_before},
         %State{} = t
       ) do
-    # Atomic cutover to compacted files
-    # Get file paths from old database
     alias Bedrock.DataPlane.Materializer.Olivine.Telemetry, as: OlivineTelemetry
 
-    # The cutover rewinds the index to the durable snapshot, so the
-    # running puller's position (and any batch it has in flight) is
-    # meaningless. Stop it first — releasing a backpressure-parked ingest
-    # reply on the way — and rejoin the stream at the durable boundary
-    # once the new state is built. The stream re-delivers everything
-    # ingested during compaction; nothing is lost and nothing special
-    # remembers it.
-    t = Logic.stop_pulling(t)
+    case IndexManager.from_compacted_pages(t.index_manager, compacted_pages, durable_version) do
+      {:error, reason} ->
+        compaction_failed(t, reason)
 
-    {data_db, index_db} = t.database
-    data_path = data_db.file_name
-    idx_path = index_db.file_name
+      {:ok, new_index_manager} ->
+        case Database.adopt_compacted_files(
+               t.database,
+               compact_data_path,
+               compact_idx_path,
+               new_data_offset,
+               index_offset,
+               durable_version
+             ) do
+          {:error, {:swap_rollback_failed, _reason, _undo_errors} = reason} ->
+            unrecoverable_compaction_swap(t, reason)
 
-    # Note: We don't explicitly close the old files - on Unix, we can rename open files,
-    # and they'll be closed automatically when no longer referenced. Attempting to close
-    # them can fail with :not_on_controlling_process due to file descriptor ownership.
+          {:error, reason} ->
+            compaction_failed(t, reason)
 
-    # Rename files atomically
+          {:ok, new_database} ->
+            # Rewind after the files are adopted. A failed adopt must not
+            # stop the puller or close live descriptors.
+            t = Logic.stop_pulling(t)
+            {new_data_db, new_index_db} = new_database
+            data_path = new_data_db.file_name
+            idx_path = new_index_db.file_name
 
-    # Create .old backup names
-    old_data_path = data_path ++ ~c".old"
-    old_idx_path = idx_path ++ ~c".old"
+            new_state = %{
+              t
+              | database: new_database,
+                index_manager: new_index_manager,
+                intake_queue: IntakeQueue.new(),
+                compaction_task: nil,
+                allow_window_advancement: true
+            }
 
-    :ok = :file.rename(data_path, old_data_path)
-    :ok = :file.rename(idx_path, old_idx_path)
-    :ok = :file.rename(compact_data_path, data_path)
-    :ok = :file.rename(compact_idx_path, idx_path)
+            values_compacted = Enum.sum(Enum.map(compacted_pages, fn {_, {page, _}} -> Page.key_count(page) end))
 
-    # Clean up .old backup files after successful rename
-    :ok = :file.delete(old_data_path)
-    :ok = :file.delete(old_idx_path)
+            OlivineTelemetry.trace_compaction_complete(durable_version,
+              duration_μs: duration,
+              data_size_before: data_size_before,
+              data_size_after: new_data_offset,
+              index_size_before: index_size_before,
+              index_size_after: index_offset,
+              values_compacted: values_compacted
+            )
 
-    # Build new database structures from compacted files
-    # File name is now the original path (we renamed compact to replace it)
-    new_data_db = %DataDatabase{
-      file: compact_data_fd,
-      file_offset: new_data_offset,
-      file_name: data_path,
-      window_size_in_microseconds: 5_000_000,
-      buffer: :ets.new(:buffer, [:ordered_set, :protected, {:read_concurrency, true}])
-    }
-
-    new_index_db = %IndexDatabase{
-      file: compact_idx_fd,
-      file_offset: index_offset,
-      file_name: idx_path,
-      durable_version: durable_version,
-      last_block_empty: false,
-      last_block_offset: 0,
-      last_block_previous_version: nil
-    }
-
-    new_database = {new_data_db, new_index_db}
-
-    # Build index structures from in-memory compacted pages
-    new_tree = Index.Tree.from_page_map(compacted_pages)
-    {min_key, max_key} = calculate_key_bounds_from_pages(compacted_pages)
-
-    # Get max_keys_per_page from the durable version's index
-    {^durable_version, {durable_index, _modified}} =
-      Enum.find(t.index_manager.versions, fn {v, _} -> v == durable_version end)
-
-    new_index = %Index{
-      tree: new_tree,
-      page_map: compacted_pages,
-      min_key: min_key,
-      max_key: max_key,
-      max_keys_per_page: durable_index.max_keys_per_page,
-      target_keys_per_page: durable_index.target_keys_per_page
-    }
-
-    new_index_manager = %IndexManager{
-      versions: [{durable_version, {new_index, %{}}}],
-      current_version: durable_version,
-      window_size_in_microseconds: 5_000_000,
-      id_allocator: t.index_manager.id_allocator,
-      output_queue: :queue.new(),
-      last_version_ended_at_offset: 0,
-      window_lag_time_μs: 5_000_000,
-      n_keys: IndexManager.info(t.index_manager, :n_keys)
-    }
-
-    # Reset state for replay
-    new_state = %{
-      t
-      | database: new_database,
-        index_manager: new_index_manager,
-        intake_queue: IntakeQueue.new(),
-        compaction_task: nil,
-        allow_window_advancement: true
-    }
-
-    # Emit completion telemetry
-    values_compacted = Enum.sum(Enum.map(compacted_pages, fn {_, {page, _}} -> Page.key_count(page) end))
-
-    OlivineTelemetry.trace_compaction_complete(durable_version,
-      duration_μs: duration,
-      data_size_before: data_size_before,
-      data_size_after: new_data_offset,
-      index_size_before: index_size_before,
-      index_size_after: index_offset,
-      values_compacted: values_compacted
-    )
-
-    # Optionally upload snapshot to ObjectStorage (async, fire-and-forget)
-    Logic.maybe_upload_snapshot(new_state, data_path, idx_path, durable_version)
-
-    # Resume: a fresh puller joins the stream at the durable boundary and
-    # re-delivers everything after it through the normal apply path.
-    noreply(Logic.resume_pulling_from(new_state, durable_version))
+            Logic.maybe_upload_snapshot(new_state, data_path, idx_path, durable_version)
+            noreply(Logic.resume_pulling_from(new_state, durable_version))
+        end
+    end
   end
 
   @impl true
-  def handle_info({:compaction_failed, reason}, %State{} = t) do
-    # Log error and resume normal operation
-    require Logger
-
-    Logger.error("Compaction failed: #{inspect(reason)}")
-
-    # Clean up any partial .compact files
-    {data_db, index_db} = t.database
-
-    try do
-      :file.delete(data_db.file_name ++ ~c".compact")
-      :file.delete(index_db.file_name ++ ~c".compact")
-    catch
-      _, _ -> :ok
-    end
-
-    # Resume normal operation
-    updated_state = %{t | compaction_task: nil, allow_window_advancement: true}
-    noreply(updated_state)
-  end
+  def handle_info({:compaction_failed, reason}, %State{} = t), do: compaction_failed(t, reason)
 
   @impl true
   def handle_info(_msg, state), do: {:noreply, state}
@@ -496,28 +418,27 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Server do
 
   defp schedule_waiter_expiration(_previous_manager, _updated_manager, _wait_ms), do: :ok
 
-  # Calculate min/max key bounds from page_map
-  defp calculate_key_bounds_from_pages(page_map) when map_size(page_map) == 0, do: {<<0xFF, 0xFF>>, <<>>}
+  defp compaction_failed(%State{} = t, reason) do
+    require Logger
 
-  defp calculate_key_bounds_from_pages(page_map) do
-    min_key =
-      page_map
-      |> Enum.map(fn {_id, {page, _next}} -> Page.left_key(page) end)
-      |> Enum.reject(&is_nil/1)
-      |> case do
-        [] -> <<0xFF, 0xFF>>
-        keys -> Enum.min(keys)
-      end
+    Logger.error("Compaction failed: #{inspect(reason)}")
 
-    max_key =
-      page_map
-      |> Enum.map(fn {_id, {page, _next}} -> Page.right_key(page) end)
-      |> Enum.reject(&is_nil/1)
-      |> case do
-        [] -> <<>>
-        keys -> Enum.max(keys)
-      end
+    {data_db, index_db} = t.database
 
-    {min_key, max_key}
+    try do
+      :file.delete(data_db.file_name ++ ~c".compact")
+      :file.delete(index_db.file_name ++ ~c".compact")
+    catch
+      _, _ -> :ok
+    end
+
+    noreply(%{t | compaction_task: nil, allow_window_advancement: true})
+  end
+
+  defp unrecoverable_compaction_swap(%State{} = t, reason) do
+    require Logger
+
+    Logger.error("Compaction swap rollback failed; backups preserved: #{inspect(reason)}")
+    stop(t, {:unrecoverable_compaction_swap, reason})
   end
 end

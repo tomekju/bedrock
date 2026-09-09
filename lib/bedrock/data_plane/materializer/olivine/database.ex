@@ -12,12 +12,23 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Database do
   @type locator :: DataDatabase.locator()
 
   @spec open(otp_name :: atom(), file_path :: String.t(), opts :: keyword()) ::
-          {:ok, t()} | {:error, :system_limit | :badarg | File.posix()}
+          {:ok, t()} | {:error, :compaction_recovery_required | :system_limit | :badarg | File.posix()}
   def open(otp_name, file_path, opts \\ []) when is_atom(otp_name) and is_list(opts) do
-    with {:ok, data_db} <- DataDatabase.open(file_path, opts),
+    with :ok <- require_complete_cutover(file_path),
+         {:ok, data_db} <- DataDatabase.open(file_path, opts),
          {:ok, index_db} <- IndexDatabase.open(otp_name, file_path) do
       {:ok, {data_db, index_db}}
     end
+  end
+
+  # A supervisor restart must not create an empty file over an interrupted swap.
+  # Leave both originals and compacted recovery inputs for explicit recovery.
+  defp require_complete_cutover(file_path) do
+    directory = Path.dirname(file_path)
+
+    if Enum.any?(["data.old", "idx.old"], &File.exists?(Path.join(directory, &1))),
+      do: {:error, :compaction_recovery_required},
+      else: :ok
   end
 
   @spec close(t()) :: :ok
@@ -25,6 +36,152 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Database do
     DataDatabase.close(data_db)
     IndexDatabase.close(index_db)
     :ok
+  end
+
+  @doc """
+  Replace live database files with compacted ones and reopen them in this process.
+
+  The compaction task must already have synced and closed the compact files.
+  Both compact files are opened here first. Originals stay open until that
+  succeeds, so a missing or invalid second file does not close live FDs or ETS.
+  Backups are removed only after the swap completes. A failed rollback is
+  returned as `{:swap_rollback_failed, reason, undo_errors}` and leaves
+  backups in place.
+  """
+  @spec adopt_compacted_files(
+          t(),
+          compact_data_path :: charlist(),
+          compact_idx_path :: charlist(),
+          data_offset :: non_neg_integer(),
+          idx_offset :: non_neg_integer(),
+          durable_version :: Bedrock.version(),
+          opts :: keyword()
+        ) :: {:ok, t()} | {:error, term()}
+  def adopt_compacted_files(
+        {data_db, index_db},
+        compact_data_path,
+        compact_idx_path,
+        data_offset,
+        idx_offset,
+        durable_version,
+        opts \\ []
+      ) do
+    data_path = data_db.file_name
+    idx_path = index_db.file_name
+    window_size_in_microseconds = data_db.window_size_in_microseconds
+    old_data_path = data_path ++ ~c".old"
+    old_idx_path = idx_path ++ ~c".old"
+    rename = Keyword.get(opts, :rename, &:file.rename/2)
+
+    case open_compact_pair(
+           compact_data_path,
+           compact_idx_path,
+           data_offset,
+           idx_offset,
+           window_size_in_microseconds,
+           durable_version
+         ) do
+      {:error, reason} ->
+        {:error, reason}
+
+      {:ok, new_data_db, new_index_db} ->
+        case swap_compact_paths(
+               data_path,
+               idx_path,
+               compact_data_path,
+               compact_idx_path,
+               old_data_path,
+               old_idx_path,
+               rename
+             ) do
+          :ok ->
+            DataDatabase.close(data_db)
+            IndexDatabase.close(index_db)
+            _ = :file.delete(old_data_path)
+            _ = :file.delete(old_idx_path)
+            {:ok, {%{new_data_db | file_name: data_path}, %{new_index_db | file_name: idx_path}}}
+
+          {:error, reason} ->
+            DataDatabase.close(new_data_db)
+            IndexDatabase.close(new_index_db)
+            {:error, reason}
+        end
+    end
+  end
+
+  defp open_compact_pair(
+         compact_data_path,
+         compact_idx_path,
+         data_offset,
+         idx_offset,
+         window_size_in_microseconds,
+         durable_version
+       ) do
+    case DataDatabase.open_existing(compact_data_path, data_offset, window_size_in_microseconds) do
+      {:ok, new_data_db} ->
+        case IndexDatabase.open_existing(compact_idx_path, idx_offset, durable_version) do
+          {:ok, new_index_db} ->
+            {:ok, new_data_db, new_index_db}
+
+          {:error, reason} ->
+            DataDatabase.close(new_data_db)
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp swap_compact_paths(
+         data_path,
+         idx_path,
+         compact_data_path,
+         compact_idx_path,
+         old_data_path,
+         old_idx_path,
+         rename
+       ) do
+    rename_all(
+      [
+        {data_path, old_data_path},
+        {idx_path, old_idx_path},
+        {compact_data_path, data_path},
+        {compact_idx_path, idx_path}
+      ],
+      [],
+      rename
+    )
+  end
+
+  defp rename_all([], _done, _rename), do: :ok
+
+  defp rename_all([{from, to} | rest], done, rename) do
+    case rename.(from, to) do
+      :ok ->
+        rename_all(rest, [{to, from} | done], rename)
+
+      {:error, reason} ->
+        case undo_renames(done, rename) do
+          :ok -> {:error, {:swap_failed, reason}}
+          {:error, undo_errors} -> {:error, {:swap_rollback_failed, reason, undo_errors}}
+        end
+    end
+  end
+
+  defp undo_renames(done, rename) do
+    errors =
+      Enum.reduce(done, [], fn {current, previous}, acc ->
+        case rename.(current, previous) do
+          :ok -> acc
+          {:error, reason} -> [{current, previous, reason} | acc]
+        end
+      end)
+
+    case errors do
+      [] -> :ok
+      errors -> {:error, Enum.reverse(errors)}
+    end
   end
 
   @spec load_value(t(), locator()) :: {:ok, Bedrock.value()} | {:error, :not_found}

@@ -45,6 +45,49 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.DataDatabase do
     end
   end
 
+  @doc """
+  Open an existing data file in the calling process without truncating it.
+
+  `:read` must be present with `:write`. `:write` alone truncates. The caller
+  supplies the compacted write cursor, which must match the on-disk size.
+  """
+  @spec open_existing(
+          file_name :: charlist(),
+          file_offset :: non_neg_integer(),
+          window_size_in_microseconds :: pos_integer()
+        ) :: {:ok, t()} | {:error, term()}
+  def open_existing(file_name, file_offset, window_size_in_microseconds)
+      when is_integer(file_offset) and file_offset >= 0 and is_integer(window_size_in_microseconds) and
+             window_size_in_microseconds > 0 do
+    with {:ok, %File.Stat{type: :regular, size: size}} <- File.stat(to_string(file_name)),
+         :ok <- match_offset(size, file_offset),
+         {:ok, file} <- :file.open(file_name, [:raw, :binary, :read, :write]) do
+      case :file.position(file, {:eof, 0}) do
+        {:ok, _eof} ->
+          buffer = :ets.new(:buffer, [:ordered_set, :protected, {:read_concurrency, true}])
+
+          {:ok,
+           %__MODULE__{
+             file: file,
+             file_offset: file_offset,
+             file_name: file_name,
+             window_size_in_microseconds: window_size_in_microseconds,
+             buffer: buffer
+           }}
+
+        {:error, reason} ->
+          _ = :file.close(file)
+          {:error, reason}
+      end
+    else
+      {:ok, %File.Stat{type: type}} -> {:error, type}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp match_offset(size, file_offset) when size == file_offset, do: :ok
+  defp match_offset(size, file_offset), do: {:error, {:offset_mismatch, size, file_offset}}
+
   @spec close(t()) :: :ok
   def close(db) do
     try do

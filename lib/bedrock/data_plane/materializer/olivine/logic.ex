@@ -383,65 +383,79 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Logic do
   @doc """
   Initiates background compaction of database files.
 
-  Returns a Task that will build compacted files. The task sends a message to the
-  calling process when complete with the compacted file handles and page_map.
+  Returns a Task that will build compacted files. The task snapshots the
+  exact durable version's page map, syncs and closes the files it opened,
+  then notifies the caller with paths, offsets, and page_map. The caller
+  must reopen those files in its own process.
+
+  Fails closed without starting a task when the durable version is not in
+  the in-memory version list.
 
   This function does not block - compaction happens in the background.
   """
-  @spec start_compaction(State.t()) :: {:ok, Task.t()}
+  @spec start_compaction(State.t()) :: {:ok, Task.t()} | {:error, :durable_version_unavailable}
   def start_compaction(%State{} = state) do
     database = state.database
-    # Get complete current page_map from index
-    complete_page_map = IndexManager.get_complete_page_map(state.index_manager)
-    caller = self()
-
     durable_version = Database.durable_version(database)
     {data_db, index_db} = database
 
-    # Emit start telemetry
-    OlivineTelemetry.trace_compaction_started(durable_version,
-      data_size_before: data_db.file_offset,
-      index_size_before: index_db.file_offset
-    )
+    case IndexManager.page_map_for_version(state.index_manager, durable_version) do
+      {:error, :not_found} ->
+        OlivineTelemetry.trace_compaction_failed(:durable_version_unavailable)
+        {:error, :durable_version_unavailable}
 
-    # Prepare compact file paths
-    compact_data_path = data_db.file_name ++ ~c".compact"
-    compact_idx_path = index_db.file_name ++ ~c".compact"
+      {:ok, durable_page_map} ->
+        caller = self()
 
-    task =
-      Task.async(fn ->
-        start_time = System.monotonic_time(:microsecond)
+        OlivineTelemetry.trace_compaction_started(durable_version,
+          data_size_before: data_db.file_offset,
+          index_size_before: index_db.file_offset
+        )
 
-        with {:ok, writer} <- SplitFileWriter.new(compact_data_path, compact_idx_path),
-             {:ok, result, compacted_pages, durable_version} <-
-               Database.compact(database, complete_page_map, SplitFileWriter, writer) do
-          duration = System.monotonic_time(:microsecond) - start_time
+        compact_data_path = data_db.file_name ++ ~c".compact"
+        compact_idx_path = index_db.file_name ++ ~c".compact"
 
-          send(caller, {
-            :compaction_ready,
-            result.data_fd,
-            result.idx_fd,
-            result.data_path,
-            result.idx_path,
-            result.data_offset,
-            result.idx_offset,
-            compacted_pages,
-            durable_version,
-            duration,
-            data_db.file_offset,
-            index_db.file_offset
-          })
+        task =
+          Task.async(fn ->
+            start_time = System.monotonic_time(:microsecond)
 
-          :ok
-        else
-          {:error, reason} ->
-            OlivineTelemetry.trace_compaction_failed(reason)
-            send(caller, {:compaction_failed, reason})
-            {:error, reason}
-        end
-      end)
+            case SplitFileWriter.new(compact_data_path, compact_idx_path) do
+              {:ok, writer} ->
+                case Database.compact(database, durable_page_map, SplitFileWriter, writer) do
+                  {:ok, result, compacted_pages, compact_durable_version} ->
+                    duration = System.monotonic_time(:microsecond) - start_time
 
-    {:ok, task}
+                    send(caller, {
+                      :compaction_ready,
+                      result.data_path,
+                      result.idx_path,
+                      result.data_offset,
+                      result.idx_offset,
+                      compacted_pages,
+                      compact_durable_version,
+                      duration,
+                      data_db.file_offset,
+                      index_db.file_offset
+                    })
+
+                    :ok
+
+                  {:error, reason} ->
+                    SplitFileWriter.close(writer)
+                    OlivineTelemetry.trace_compaction_failed(reason)
+                    send(caller, {:compaction_failed, reason})
+                    {:error, reason}
+                end
+
+              {:error, reason} ->
+                OlivineTelemetry.trace_compaction_failed(reason)
+                send(caller, {:compaction_failed, reason})
+                {:error, reason}
+            end
+          end)
+
+        {:ok, task}
+    end
   end
 
   @doc """

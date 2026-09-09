@@ -23,6 +23,8 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.CompactionWriter do
   @doc """
   Finish writing and return the result.
   Implementations should sync files to disk before returning.
+  SplitFile also closes the descriptors it opened; do not return raw fds
+  for another process to write or sync.
   """
   @callback finish(t()) :: {:ok, result()} | {:error, term()}
 

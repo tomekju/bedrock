@@ -259,11 +259,60 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexManager do
 
   @doc """
   Extracts the complete page_map from the current version's index.
-  Used during compaction to get all current pages.
   """
   @spec get_complete_page_map(t()) :: %{Page.id() => {Page.t(), Page.id()}}
   def get_complete_page_map(%{versions: [{_, {current_index, _}} | _]}), do: current_index.page_map
   def get_complete_page_map(%{versions: []}), do: %{}
+
+  @doc """
+  Return the page map for an exact version.
+
+  Compaction must snapshot the durable version, not the newest in-memory
+  index. A missing version is an error; callers must not fall back.
+  """
+  @spec page_map_for_version(t(), Bedrock.version()) ::
+          {:ok, %{Page.id() => {Page.t(), Page.id()}}} | {:error, :not_found}
+  def page_map_for_version(%{versions: versions}, version) do
+    case List.keyfind(versions, version, 0) do
+      {^version, {index, _modified}} -> {:ok, index.page_map}
+      nil -> {:error, :not_found}
+    end
+  end
+
+  @doc """
+  Rebuild manager state from a durable compacted page map.
+
+  `id_allocator` and `n_keys` come from those pages, matching
+  `Index.load_from/1`. Newest-manager free IDs must not be reused: a page
+  recycled by a suffix may still be live at the durable version.
+  """
+  @spec from_compacted_pages(t(), %{Page.id() => {Page.t(), Page.id()}}, Bedrock.version()) ::
+          {:ok, t()} | {:error, :durable_version_unavailable}
+  def from_compacted_pages(%__MODULE__{} = index_manager, compacted_pages, durable_version) do
+    case List.keyfind(index_manager.versions, durable_version, 0) do
+      {^durable_version, {durable_index, _modified}} ->
+        {:ok, index, max_id, free_ids, n_keys} =
+          Index.build_from_page_map(compacted_pages,
+            max_keys_per_page: durable_index.max_keys_per_page,
+            target_keys_per_page: durable_index.target_keys_per_page
+          )
+
+        {:ok,
+         %__MODULE__{
+           versions: [{durable_version, {index, %{}}}],
+           current_version: durable_version,
+           window_size_in_microseconds: index_manager.window_size_in_microseconds,
+           id_allocator: IdAllocator.new(max_id, free_ids),
+           output_queue: :queue.new(),
+           last_version_ended_at_offset: 0,
+           window_lag_time_μs: index_manager.window_lag_time_μs,
+           n_keys: n_keys
+         }}
+
+      nil ->
+        {:error, :durable_version_unavailable}
+    end
+  end
 
   @spec index_for_version(version_list(), Bedrock.version()) :: Index.t() | nil
   defp index_for_version(versions, target), do: find_target(versions, target)

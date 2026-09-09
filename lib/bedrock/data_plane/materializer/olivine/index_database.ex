@@ -80,6 +80,46 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexDatabase do
     end
   end
 
+  @doc """
+  Open an existing index file in the calling process without truncating it.
+
+  `:read` must be present with `:write`. `:write` alone truncates. The compacted
+  write cursor must match the on-disk size. `last_block_*` matches a fresh
+  snapshot: one self-loop block starting at offset 0.
+  """
+  @spec open_existing(file_name :: charlist(), file_offset :: non_neg_integer(), durable_version :: Bedrock.version()) ::
+          {:ok, t()} | {:error, term()}
+  def open_existing(file_name, file_offset, durable_version)
+      when is_integer(file_offset) and file_offset >= 0 and is_binary(durable_version) do
+    with {:ok, %File.Stat{type: :regular, size: size}} <- File.stat(to_string(file_name)),
+         :ok <- match_offset(size, file_offset),
+         {:ok, file} <- :file.open(file_name, [:raw, :binary, :read, :write]) do
+      case :file.position(file, {:eof, 0}) do
+        {:ok, _eof} ->
+          {:ok,
+           %__MODULE__{
+             file: file,
+             file_name: file_name,
+             file_offset: file_offset,
+             durable_version: durable_version,
+             last_block_empty: false,
+             last_block_offset: 0,
+             last_block_previous_version: nil
+           }}
+
+        {:error, reason} ->
+          _ = :file.close(file)
+          {:error, reason}
+      end
+    else
+      {:ok, %File.Stat{type: type}} -> {:error, type}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp match_offset(size, file_offset) when size == file_offset, do: :ok
+  defp match_offset(size, file_offset), do: {:error, {:offset_mismatch, size, file_offset}}
+
   @spec close(t()) :: :ok
   def close(index_db) do
     _ = safe_call(fn -> :file.sync(index_db.file) end)

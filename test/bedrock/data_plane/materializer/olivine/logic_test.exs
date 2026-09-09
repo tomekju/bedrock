@@ -438,8 +438,8 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.LogicTest do
 
       assert {:ok, %Task{} = task} = Logic.start_compaction(state)
 
-      assert_receive {:compaction_ready, _data_fd, _idx_fd, data_path, idx_path, data_offset, idx_offset,
-                      compacted_pages, durable_version, duration_μs, data_size_before, idx_size_before},
+      assert_receive {:compaction_ready, data_path, idx_path, data_offset, idx_offset, compacted_pages, durable_version,
+                      duration_μs, data_size_before, idx_size_before},
                      10_000
 
       assert durable_version == expected_durable_version
@@ -458,8 +458,6 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.LogicTest do
 
       assert :ok = Task.await(task, 10_000)
 
-      # The raw fds are owned by the (now finished) task process; just remove
-      # the compact files that were produced.
       File.rm(to_string(data_path))
       File.rm(to_string(idx_path))
 
