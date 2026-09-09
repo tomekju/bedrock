@@ -23,8 +23,30 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Index.TreeTest do
       # Key "j" should go to page 2 (contains "g" to "m")
       assert Tree.page_for_key(tree, "j") == 2
 
-      # Key "z" (beyond all pages) should go to rightmost page (always 0)
-      assert Tree.page_for_key(tree, "z") == 0
+      # New maximum keys belong to the actual rightmost page.
+      assert Tree.page_for_key(tree, "z") == 2
+    end
+
+    test "new maximum keys do not hide existing leftmost keys" do
+      left = Page.new(0, [{"a", <<1::64>>}, {"b", <<2::64>>}])
+      right = Page.new(1, [{"c", <<3::64>>}, {"d", <<4::64>>}])
+      pages = %{0 => {left, 1}, 1 => {right, 0}}
+      tree = Tree.from_page_map(pages)
+
+      insertion_page = Tree.page_for_key(tree, "z")
+      assert insertion_page == 1
+      {old_page, _next} = Map.fetch!(pages, insertion_page)
+      updated_page = Page.new(insertion_page, Page.key_locators(old_page) ++ [{"z", <<5::64>>}])
+      updated_tree = Tree.update_page_in_tree(tree, old_page, updated_page)
+
+      assert Tree.page_for_key(updated_tree, "a") == 0
+      assert Tree.page_for_key(updated_tree, "b") == 0
+      assert Tree.page_for_key(updated_tree, "c") == 1
+      assert Tree.page_for_key(updated_tree, "z") == 1
+    end
+
+    test "empty trees retain the initial page zero destination" do
+      assert Tree.page_for_key(:gb_trees.empty(), "a") == 0
     end
   end
 
@@ -43,8 +65,8 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.Index.TreeTest do
       # In gap-free design, all keys map to a page
       # "key0" would go in page 1
       assert Tree.page_for_key(tree, "key0") == 1
-      # "key4" beyond all pages goes to rightmost (0)
-      assert Tree.page_for_key(tree, "key4") == 0
+      # "key4" beyond all pages goes to the sole rightmost page.
+      assert Tree.page_for_key(tree, "key4") == 1
     end
 
     test "adds page 0 with no keys to tree" do

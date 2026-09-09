@@ -86,6 +86,22 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexUpdateTest do
   end
 
   describe "pending-operation merging" do
+    test "a new maximum preserves lookups across existing pages", %{database: database} do
+      {index, allocator} = build_index([{0, ["a", "b"]}, {1, ["c", "d"]}])
+
+      update = run_mutations(index, allocator, database, [{:set, "z", "value-z"}])
+      {updated_index, updated_db, _allocator, _modified} = IndexUpdate.finish(update)
+
+      for key <- ["a", "b", "c", "d", "z"] do
+        assert {:ok, _page, _locator} = Index.locator_for_key(updated_index, key)
+      end
+
+      assert {:ok, page, locator} = Index.locator_for_key(updated_index, "z")
+      assert Page.id(page) == 1
+      assert {:ok, "value-z"} = Database.load_value(updated_db, locator)
+      assert all_keys(updated_index) == ["a", "b", "c", "d", "z"]
+    end
+
     test "two clears targeting keys on the same page merge into one pending map", %{database: database} do
       {index, allocator} = build_index([{0, ["a", "b", "c"]}])
 
@@ -190,8 +206,8 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.IndexUpdateTest do
 
   describe "chain-following edge cases" do
     test "range entirely beyond all keys is a no-op", %{database: database} do
-      # page_for_key falls back to page 0 (the empty head), so the chain walk
-      # skips every real page as entirely-before-range until the chain ends.
+      # page_for_key selects the rightmost page, which is entirely before
+      # this range; its terminal chain pointer ends the walk without changes.
       {index, allocator} =
         build_index([
           {1, ["a", "b"]},
