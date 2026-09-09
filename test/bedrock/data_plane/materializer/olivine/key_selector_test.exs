@@ -93,20 +93,20 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.KeySelectorTest do
       start_selector = KeySelector.first_greater_or_equal("range:a")
       end_selector = KeySelector.first_greater_than("range:z")
 
-      result = ReadingTestHelpers.get_range(state, start_selector, end_selector, test_version(), [])
-      # Range may not find data or could succeed
-      case result do
-        {:ok, {key_value_pairs, _has_more}} ->
-          assert is_list(key_value_pairs)
-          assert Enum.all?(key_value_pairs, fn {k, v} -> is_binary(k) and is_binary(v) end)
-          # Should include range keys if data exists
-          keys = Enum.map(key_value_pairs, fn {k, _v} -> k end)
-          assert Enum.any?(keys, fn k -> String.starts_with?(k, "range:") end)
+      assert {:ok, {key_value_pairs, _has_more}} =
+               ReadingTestHelpers.get_range(state, start_selector, end_selector, test_version(), [])
 
-        {:error, _reason} ->
-          # Acceptable for test data setup
-          :ok
-      end
+      assert is_list(key_value_pairs)
+
+      keys =
+        Enum.map(key_value_pairs, fn {k, v} ->
+          assert is_binary(k) and is_binary(v)
+          k
+        end)
+
+      assert "range:a" in keys
+      assert "range:z" in keys
+      refute "test:key" in keys
     end
 
     test "range_fetch/5 handles invalid ranges", %{state: state} do
@@ -136,13 +136,9 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.KeySelectorTest do
     test "page_for_key/3 with KeySelector finds correct page", %{state: state} do
       key_selector = KeySelector.first_greater_than("key1")
 
-      assert {:ok, resolved_key, page} =
+      assert {:ok, "key2", page} =
                IndexManager.page_for_key(state.index_manager, key_selector, test_version())
 
-      # first_greater_than "key1" should resolve to the next available key
-      # Could be key2 or key3 depending on sort order
-      assert resolved_key in ["key2", "key3"]
-      # Page can be binary or page_map
       assert is_binary(page) or is_map(page)
     end
 
@@ -150,12 +146,11 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.KeySelectorTest do
       start_selector = KeySelector.first_greater_or_equal("key1")
       end_selector = KeySelector.last_less_than("range")
 
-      assert {:ok, {"key1", resolved_end}, pages} =
+      assert {:ok, {"key1", "key3"}, pages} =
                IndexManager.pages_for_range(state.index_manager, start_selector, end_selector, test_version())
 
-      assert is_binary(resolved_end)
       assert is_list(pages)
-      # resolved_end should be the last key less than "range"
+      assert "key3" < "range"
     end
 
     test "resolution handles version constraints", %{state: state} do

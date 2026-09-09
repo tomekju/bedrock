@@ -123,15 +123,14 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.KeySelectorPropertyTest do
 
   # Property Tests
 
-  property "KeySelector resolution either succeeds or returns a boundary error" do
+  property "KeySelector resolution matches the independent sorted-key oracle" do
     check all({index, key_selector} <- StreamData.tuple({multi_page_index_generator(), key_selector_generator()})) do
       index_manager = create_index_manager(index)
+      sorted = get_all_keys_from_index(index)
+      expected = oracle_resolve(sorted, key_selector)
+      actual = normalize_page_for_key(IndexManager.page_for_key(index_manager, key_selector, 1))
 
-      case IndexManager.page_for_key(index_manager, key_selector, 1) do
-        {:ok, _resolved_key, _page} -> true
-        {:error, :not_found} -> true
-        _other -> false
-      end
+      assert actual == expected
     end
   end
 
@@ -149,27 +148,29 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.KeySelectorPropertyTest do
       selector1 = key |> KeySelector.first_greater_or_equal() |> KeySelector.add(offset1)
       selector2 = key |> KeySelector.first_greater_or_equal() |> KeySelector.add(offset2)
       index_manager = create_index_manager(index)
+      sorted = get_all_keys_from_index(index)
 
-      case {IndexManager.page_for_key(index_manager, selector1, 1),
-            IndexManager.page_for_key(index_manager, selector2, 1)} do
-        {{:ok, key1, _}, {:ok, key2, _}} when key1 <= key2 -> true
-        # If either fails to resolve, we can't compare
-        _ -> true
+      actual1 = normalize_page_for_key(IndexManager.page_for_key(index_manager, selector1, 1))
+      actual2 = normalize_page_for_key(IndexManager.page_for_key(index_manager, selector2, 1))
+
+      assert actual1 == oracle_resolve(sorted, selector1)
+      assert actual2 == oracle_resolve(sorted, selector2)
+
+      case {actual1, actual2} do
+        {{:ok, earlier_key}, {:ok, later_key}} -> assert earlier_key <= later_key
+        {_, _} -> :ok
       end
     end
   end
 
   property "Circuit breaker prevents infinite loops" do
     check all(index <- multi_page_index_generator()) do
-      # Create a KeySelector with a very large offset that would require many page hops
       extreme_selector = "" |> KeySelector.first_greater_or_equal() |> KeySelector.add(10_000)
       index_manager = create_index_manager(index)
+      sorted = get_all_keys_from_index(index)
 
-      case IndexManager.page_for_key(index_manager, extreme_selector, 1) do
-        {:error, :not_found} -> true
-        {:ok, _key, _page} -> true
-        _other -> false
-      end
+      assert oracle_resolve(sorted, extreme_selector) == {:error, :not_found}
+      assert {:error, :not_found} = IndexManager.page_for_key(index_manager, extreme_selector, 1)
     end
   end
 
@@ -189,24 +190,29 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.KeySelectorPropertyTest do
 
   property "Range KeySelector results have consistent bounds" do
     check all(
-            {index, start_key, end_key} <-
+            {index, start_anchor, end_anchor} <-
               {
                 multi_page_index_generator(),
                 ordered_key_pair_generator()
               }
               |> StreamData.tuple()
-              |> StreamData.map(fn {index, {start_key, end_key}} -> {index, start_key, end_key} end)
+              |> StreamData.map(fn {index, {start_anchor, end_anchor}} -> {index, start_anchor, end_anchor} end)
           ) do
-      start_selector = KeySelector.first_greater_or_equal(start_key)
-      end_selector = KeySelector.first_greater_than(end_key)
+      start_selector = KeySelector.first_greater_or_equal(start_anchor)
+      end_selector = KeySelector.first_greater_than(end_anchor)
       index_manager = create_index_manager(index)
+      sorted = get_all_keys_from_index(index)
 
-      case IndexManager.pages_for_range(index_manager, start_selector, end_selector, 1) do
-        {:ok, {resolved_start, resolved_end}, _pages} when resolved_start <= resolved_end -> true
-        # Errors are acceptable
-        {:error, _} -> true
-        _ -> false
-      end
+      expected =
+        expected_range_result(
+          oracle_resolve(sorted, start_selector),
+          oracle_resolve(sorted, end_selector)
+        )
+
+      actual =
+        normalize_pages_for_range(IndexManager.pages_for_range(index_manager, start_selector, end_selector, 1))
+
+      assert actual == expected
     end
   end
 
@@ -221,4 +227,38 @@ defmodule Bedrock.DataPlane.Materializer.Olivine.KeySelectorPropertyTest do
     |> Enum.sort()
     |> Enum.uniq()
   end
+
+  defp oracle_resolve(sorted_keys, %KeySelector{key: key, or_equal: or_equal, offset: offset}) do
+    insertion = Enum.find_index(sorted_keys, &(&1 >= key)) || length(sorted_keys)
+    found? = insertion < length(sorted_keys) and Enum.at(sorted_keys, insertion) == key
+    base = if found? and not or_equal, do: insertion + 1, else: insertion
+    target = base + offset
+
+    if target >= 0 and target < length(sorted_keys) do
+      {:ok, Enum.at(sorted_keys, target)}
+    else
+      {:error, :not_found}
+    end
+  end
+
+  defp normalize_page_for_key({:ok, resolved_key, _page}), do: {:ok, resolved_key}
+  defp normalize_page_for_key({:error, reason}), do: {:error, reason}
+  defp normalize_page_for_key(other), do: other
+
+  defp expected_range_result({:ok, resolved_start}, {:ok, resolved_end}) when resolved_start <= resolved_end do
+    {:ok, {resolved_start, resolved_end}}
+  end
+
+  defp expected_range_result({:ok, resolved_start}, {:ok, resolved_end}) when resolved_start > resolved_end do
+    {:error, :invalid_range}
+  end
+
+  defp expected_range_result(_start_result, _end_result), do: {:error, :not_found}
+
+  defp normalize_pages_for_range({:ok, {resolved_start, resolved_end}, _pages}) do
+    {:ok, {resolved_start, resolved_end}}
+  end
+
+  defp normalize_pages_for_range({:error, reason}), do: {:error, reason}
+  defp normalize_pages_for_range(other), do: other
 end
